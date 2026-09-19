@@ -20,6 +20,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
+#import <mach-o/dyld.h>
 #import <sys/utsname.h>
 #import <sys/sysctl.h>
 #import <sys/param.h>
@@ -77,6 +78,10 @@ static NDConfig *g_cfg = nil;
 static os_unfair_lock g_cfgLock = OS_UNFAIR_LOCK_INIT;
 
 static void NDResolveRealSymbols(void);
+static int (*nd_real_sysctlbyname)(const char *, void *, size_t *, void *, size_t);
+static int (*nd_real_sysctl)(int *, u_int, void *, size_t *, void *, size_t);
+static int (*nd_real_uname)(struct utsname *);
+static int (*nd_real_statfs)(const char *, struct statfs *);
 
 static NSString *NDConfigPath(void) {
     NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
@@ -168,11 +173,6 @@ static void NDLoadConfig(void) {
 }
 
 // ============================== C 层 interpose ==============================
-
-static int (*nd_real_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
-static int (*nd_real_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
-static int (*nd_real_uname)(struct utsname *) = NULL;
-static int (*nd_real_statfs)(const char *, struct statfs *) = NULL;
 
 static void NDResolveRealSymbols(void) {
     static dispatch_once_t onceToken;
@@ -716,7 +716,7 @@ static void NDSeedPassCustom(NDConfig *c) {
         if (stale) {
             NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"";
             NSArray<NSString *> *parts = [appVer componentsSeparatedByString:@"."];
-            if (parts.count > 3) appVer = [parts subarrayWithRange:NSMakeRange(0, 3)].componentsJoinedByString:@".";
+            if (parts.count > 3) appVer = [[parts subarrayWithRange:NSMakeRange(0, 3)] componentsJoinedByString:@"."];
             NSString *sdkVer = c.passSdkVersion.length ? c.passSdkVersion : @"9.8.12.20";
             NSString *ua = [NSString stringWithFormat:
                 @"Mozilla/5.0 (iPhone; CPU iPhone OS %@ like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Sapi_%@/%@_%@_%@_Sapi",
