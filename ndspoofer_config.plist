@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>configVersion</key>
+	<integer>1</integer>
+	<key>enabled</key>
+	<false/>
+	<key>spoofSysctl</key>
+	<false/>
+	<key>spoofUIDevice</key>
+	<false/>
+	<key>spoofBaiduSDK</key>
+	<false/>
+	<key>spoofUA</key>
+	<false/>
+	<key>spoofIDFV</key>
+	<false/>
+	<key>spoofStorage</key>
+	<false/>
+	<key>seedPassCustom</key>
+	<false/>
+	<key>hwMachine</key>
+	<string>iPhone10,1</string>
+	<key>hwModel</key>
+	<string>D20AP</string>
+	<key>marketingName</key>
+	<string>iPhone8</string>
+	<key>systemVersion</key>
+	<string>16.7.2</string>
+	<key>systemBuild</key>
+	<string>20H115</string>
+	<key>cpuBrand</key>
+	<string>Apple A11 Bionic</string>
+	<key>kernHostname</key>
+	<string>iPhone</string>
+	<key>memorySize</key>
+	<integer>2048</integer>
+	<key>diskSize</key>
+	<integer>64</integer>
+	<key>idfv</key>
+	<string></string>
+	<key>passSdkVersion</key>
+	<string>9.8.12.20</string>
+</dict>
+</plist>

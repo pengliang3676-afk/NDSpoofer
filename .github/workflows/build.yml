@@ -1,0 +1,22 @@
+name: Build NDSpoofer
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build and verify release with Xcode
+        run: bash scripts/build_release_xcode.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NDSpoofer-9.19-01
+          path: |
+            dist/NDSpoofer_9.19-01.dylib
+            dist/NDSpooferCraneManager_9.19-01_RootHide.deb
+            dist/ndspoofer_config.plist
+            dist/SHA256SUMS.txt

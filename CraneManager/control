@@ -1,0 +1,9 @@
+Package: com.peng.ndspoofer.cranemanager
+Name: 网盘解
+Version: 9.19-01
+Architecture: iphoneos-arm64e
+Description: 为百度网盘的 Crane 容器逐容器生成并写入 NDSpoofer 设备指纹配置。
+Maintainer: peng
+Author: peng
+Section: Utilities
+Depends: firmware (>= 15.0), rootless-compat (>= 0.9), byg.iosios.net.crane-rootless (>= 1.3.14-6), com.opa334.libsandy
