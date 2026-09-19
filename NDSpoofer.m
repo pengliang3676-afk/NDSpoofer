@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.19-01
+//  版本：9.19-02
 //
 //  设计原则（与探针 NDProbe2 证据一一对应）：
 //   1. 只在 com.baidu.netdisk 主进程生效，扩展（.appex/PlugIns）不生效。
@@ -77,12 +77,6 @@ static NSString * const NDConfigFileName = @"ndspoofer_config.plist";
 static NDConfig *g_cfg = nil;
 static os_unfair_lock g_cfgLock = OS_UNFAIR_LOCK_INIT;
 
-static void NDResolveRealSymbols(void);
-static int (*nd_real_sysctlbyname)(const char *, void *, size_t *, void *, size_t);
-static int (*nd_real_sysctl)(int *, u_int, void *, size_t *, void *, size_t);
-static int (*nd_real_uname)(struct utsname *);
-static int (*nd_real_statfs)(const char *, struct statfs *);
-
 static NSString *NDConfigPath(void) {
     NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     return [docs stringByAppendingPathComponent:NDConfigFileName];
@@ -102,26 +96,23 @@ static NSInteger NDCfgInt(NSDictionary *d, NSString *key, NSInteger def) {
 }
 
 static NSString *NDRealSysctlStr(const char *name) {
-    if (!nd_real_sysctlbyname) NDResolveRealSymbols();
     size_t len = 0;
-    if (nd_real_sysctlbyname(name, NULL, &len, NULL, 0) != 0 || len == 0) return nil;
+    if (sysctlbyname(name, NULL, &len, NULL, 0) != 0 || len == 0) return nil;
     char buf[256] = {0};
     if (len >= sizeof(buf)) len = sizeof(buf) - 1;
-    if (nd_real_sysctlbyname(name, buf, &len, NULL, 0) != 0) return nil;
+    if (sysctlbyname(name, buf, &len, NULL, 0) != 0) return nil;
     return [NSString stringWithUTF8String:buf];
 }
 static uint64_t NDRealSysctlU64(const char *name) {
-    if (!nd_real_sysctlbyname) NDResolveRealSymbols();
     uint64_t v = 0; size_t len = sizeof(v);
-    if (nd_real_sysctlbyname(name, &v, &len, NULL, 0) != 0) return 0;
+    if (sysctlbyname(name, &v, &len, NULL, 0) != 0) return 0;
     return v;
 }
 static uint64_t NDRealDiskBytes(void) {
-    if (!nd_real_statfs) NDResolveRealSymbols();
     struct statfs s;
     memset(&s, 0, sizeof(s));
-    if (nd_real_statfs("/private/var", &s) != 0) {
-        if (nd_real_statfs("/", &s) != 0) return 0;
+    if (statfs("/private/var", &s) != 0) {
+        if (statfs("/", &s) != 0) return 0;
     }
     return (uint64_t)s.f_bsize * (uint64_t)s.f_blocks;
 }
@@ -173,16 +164,8 @@ static void NDLoadConfig(void) {
 }
 
 // ============================== C 层 interpose ==============================
-
-static void NDResolveRealSymbols(void) {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        nd_real_sysctlbyname = dlsym(RTLD_NEXT, "sysctlbyname");
-        nd_real_sysctl       = dlsym(RTLD_NEXT, "sysctl");
-        nd_real_uname        = dlsym(RTLD_NEXT, "uname");
-        nd_real_statfs       = dlsym(RTLD_NEXT, "statfs");
-    });
-}
+// 直接调用原符号：dyld 对 interpose 镜像自身的绑定保留为原实现，不会递归。
+// 禁止 dlsym(RTLD_NEXT)：其结果仍会应用 interpose，可能解析回本包装函数造成无限递归。
 
 static void NDWriteCString(void *oldp, size_t *oldlenp, NSString *value) {
     if (!oldp || !oldlenp || !value.length) return;
@@ -201,8 +184,7 @@ static void NDWriteU64(void *oldp, size_t *oldlenp, uint64_t value) {
 }
 
 static int nd_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    if (!nd_real_sysctlbyname) NDResolveRealSymbols();
-    int r = nd_real_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+    int r = sysctlbyname(name, oldp, oldlenp, newp, newlen);
     NDConfig *c = NDCurrentConfig();
     if (r != 0 || !c.enabled || !c.spoofSysctl || !name || !oldp || !oldlenp) return r;
 
@@ -225,8 +207,7 @@ static int nd_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *
 }
 
 static int nd_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    if (!nd_real_sysctl) NDResolveRealSymbols();
-    int r = nd_real_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+    int r = sysctl(name, namelen, oldp, oldlenp, newp, newlen);
     NDConfig *c = NDCurrentConfig();
     if (r != 0 || !c.enabled || !c.spoofSysctl || !name || namelen < 2 || !oldp || !oldlenp) return r;
 
@@ -256,8 +237,7 @@ static int nd_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void
 }
 
 static int nd_uname(struct utsname *name) {
-    if (!nd_real_uname) NDResolveRealSymbols();
-    int r = nd_real_uname(name);
+    int r = uname(name);
     NDConfig *c = NDCurrentConfig();
     if (r != 0 || !c.enabled || !c.spoofSysctl || !name || !c.hwMachine.length) return r;
     strncpy(name->machine, c.hwMachine.UTF8String, sizeof(name->machine) - 1);
@@ -266,8 +246,7 @@ static int nd_uname(struct utsname *name) {
 }
 
 static int nd_statfs(const char *path, struct statfs *buf) {
-    if (!nd_real_statfs) NDResolveRealSymbols();
-    int r = nd_real_statfs(path, buf);
+    int r = statfs(path, buf);
     NDConfig *c = NDCurrentConfig();
     if (r != 0 || !c.enabled || !c.spoofStorage || !buf || !path || c.diskSizeGB <= 0) return r;
     // 只动数据卷；总量不变（64GB 真机 + 64GB 档案）时根本不进分支。
@@ -743,7 +722,7 @@ static UIViewController *NDTopVC(void) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.19-01\n\n"];
+    [r appendFormat:@"NDSpoofer 9.19-02\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -816,7 +795,6 @@ __attribute__((constructor))
 static void nd_constructor(void) {
     @autoreleasepool {
         if (!NDShouldRun()) return;
-        NDResolveRealSymbols();
         NDLoadConfig();
         NDConfig *c = NDCurrentConfig();
         if (!c.enabled) return;
