@@ -1,4 +1,4 @@
-report-ver : ok header : ok //
+//
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
 //  版本：9.20-01
