@@ -1,12 +1,15 @@
-//
+report-ver : ok header : ok //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.19-02
+//  版本：9.20-01
 //
-//  设计原则（与探针 NDProbe2 证据一一对应）：
+//  设计原则（与探针 NDProbe2/NDProbe3 证据一一对应）：
 //   1. 只在 com.baidu.netdisk 主进程生效，扩展（.appex/PlugIns）不生效。
 //   2. 只走原生层：sysctl/uname/statfs C 层 interpose + Objective-C runtime swizzle，
-//      绝不注入 JS、不碰 WKWebView 页面环境、不动 Mobile/15E148。
+//      绝不注入 JS、不改网页 DOM/JS 环境、不动 Mobile/15E148。
+//   2a. 9.20-01 新增原生 UA 出口改写（非 JS）：WKWebView setCustomUserAgent:、
+//      BDPUserAgent webViewDefaultUserAgent、NSMutableURLRequest UA 头、
+//      NSURLSession dataTask 出口；覆盖 WAP 登录页与 native 登录链。
 //   3. 机型池只允许与真机同屏（375x667 @2x / 750x1334）的机型，UIScreen 不 hook，
 //      从根上消除“机型与屏幕矛盾”。
 //   4. 不碰 App 版本、Sapi SDK 版本、tpl、cuid/utdid/deviceID、TeamID、运营商（默认）。
@@ -664,11 +667,253 @@ static void NDAddImageCB(const struct mach_header *mh, intptr_t slide) {
     });
 }
 
+
+// ============================== 9.20-01 UA 出口改写（原生层，最终出口） ==============================
+// 证据（NDProbe3 真机报告）：
+//   - WAP 登录页（passport.baidu.com/cap/init）UA 经 NSMutableURLRequest UA 头下发；
+//   - Sapi webview UA 经 -[WKWebView setCustomUserAgent:] 下发；
+//   - 裸 Mozilla 前缀（CPU iPhone OS 16_3）源自 -[BDPUserAgent webViewDefaultUserAgent]；
+//   - native 登录链（wappass.baidu.com /wp/api/login* 等）UA 不走 setValue:forHTTPHeaderField:，
+//     在 dataTask 出口的请求头里可见，只能在 NSURLSession dataTask 出口堵。
+// 全部为原生 ObjC swizzle，不注入 JS、不改网页内容；值统一过 NDRewriteUA，Mobile/15E148 永不触碰。
+
+static _Thread_local int g_nduInRewrite = 0;
+
+static Method NDUOwnMethod(Class cls, SEL sel) {
+    if (!cls || !sel) return NULL;
+    unsigned int count = 0;
+    Method found = NULL;
+    Method *list = class_copyMethodList(cls, &count);
+    for (unsigned int i = 0; i < count; i++) {
+        if (method_getName(list[i]) == sel) { found = list[i]; break; }
+    }
+    free(list);
+    return found;
+}
+
+static BOOL NDUIsSubclassOrSame(Class cls, Class ancestor) {
+    for (Class c = cls; c; c = class_getSuperclass(c)) if (c == ancestor) return YES;
+    return NO;
+}
+
+// 手写安全 swizzle：继承方法先在本类落地；alias 必须由本次安装成功添加。
+static BOOL NDUSwap(Class cls, SEL target, IMP tramp, SEL aliasSel, const char *types) {
+    Method ownTarget = NDUOwnMethod(cls, target);
+    if (ownTarget && method_getImplementation(ownTarget) == tramp)
+        return NDUOwnMethod(cls, aliasSel) != NULL;
+    Method m = class_getInstanceMethod(cls, target);
+    if (!m) return NO;
+    IMP orig = method_getImplementation(m);
+    const char *realTypes = method_getTypeEncoding(m);
+    if (!ownTarget && !class_addMethod(cls, target, orig, realTypes)) return NO;
+    if (!class_addMethod(cls, aliasSel, tramp, types ?: realTypes)) return NO;
+    Method tm = NDUOwnMethod(cls, target);
+    Method am = NDUOwnMethod(cls, aliasSel);
+    if (!tm || !am || method_getImplementation(am) != tramp) return NO;
+    method_exchangeImplementations(tm, am);
+    return method_getImplementation(tm) == tramp;
+}
+
+// 仅当 UA 仍含真机机型/系统/营销名标记时才改写，避免无谓复制请求。
+static BOOL NDUAContainsReal(NSString *s, NDConfig *c) {
+    if (![s isKindOfClass:NSString.class] || !s.length) return NO;
+    if (c.realMachine.length &&
+        ([s containsString:c.realMachine] || [s containsString:NDMachineEncoded(c.realMachine)]))
+        return YES;
+    if (c.realOSVersion.length && [s containsString:c.realOSVersion]) return YES;
+    NSString *realUnder = [c.realOSVersion stringByReplacingOccurrencesOfString:@"." withString:@"_"];
+    if (realUnder.length && [s containsString:[NSString stringWithFormat:@"OS %@ like", realUnder]])
+        return YES;
+    if (c.marketingName.length) {
+        for (NSString *realMarketing in @[@"iPhoneSE2", @"iPhoneSE3", @"Unknown_iPhone"]) {
+            if (![realMarketing isEqualToString:c.marketingName] &&
+                [s containsString:[NSString stringWithFormat:@";%@;", realMarketing]])
+                return YES;
+        }
+    }
+    return NO;
+}
+
+static SEL g_nduSelWkSetUA = NULL;
+static SEL g_nduSelWkDefaultUA = NULL;
+static SEL g_nduSelSetHdr = NULL;
+static SEL g_nduSelDt1 = NULL;
+static SEL g_nduSelDt2 = NULL;
+static SEL g_nduSelConn = NULL;
+
+// 1) -[WKWebView setCustomUserAgent:]：改写入参再下发
+static void ndu_tr_wkSetUA(id self, SEL _cmd, id ua) {
+    id out = ua;
+    NDConfig *c = NDCurrentConfig();
+    if (c.enabled && c.spoofUA && [ua isKindOfClass:NSString.class] && NDUAContainsReal(ua, c))
+        out = NDRewriteUA(ua, c);
+    ((void(*)(id, SEL, id))objc_msgSend)(self, g_nduSelWkSetUA, out);
+}
+
+// 2) -[BDPUserAgent webViewDefaultUserAgent]：裸 Mozilla 前缀源头
+static id ndu_tr_wkDefaultUA(id self, SEL _cmd) {
+    id orig = ((id(*)(id, SEL))objc_msgSend)(self, g_nduSelWkDefaultUA);
+    NDConfig *c = NDCurrentConfig();
+    if (c.enabled && c.spoofUA && [orig isKindOfClass:NSString.class] && NDUAContainsReal(orig, c))
+        return NDRewriteUA(orig, c);
+    return orig;
+}
+
+// 3) -[NSMutableURLRequest setValue:forHTTPHeaderField:]：仅改写 User-Agent 头
+static void ndu_tr_setHdr(id self, SEL _cmd, id value, id field) {
+    id out = value;
+    NDConfig *c = NDCurrentConfig();
+    if (g_nduInRewrite == 0 && c.enabled && c.spoofUA &&
+        [field isKindOfClass:NSString.class] &&
+        [((NSString *)field).lowercaseString isEqualToString:@"user-agent"] &&
+        [value isKindOfClass:NSString.class] && NDUAContainsReal(value, c)) {
+        out = NDRewriteUA(value, c);
+    }
+    ((void(*)(id, SEL, id, id))objc_msgSend)(self, g_nduSelSetHdr, out, field);
+}
+
+// 4) NSURLSession dataTask 出口：复制请求并改写 UA 头（覆盖 native 登录链）
+static NSURLRequest *NDURewriteRequest(NSURLRequest *req, NSURLSession *session, NDConfig *c) {
+    if (g_nduInRewrite || !c.enabled || !c.spoofUA || ![req isKindOfClass:NSURLRequest.class])
+        return req;
+    __block NSString *ua = nil;
+    [req.allHTTPHeaderFields enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
+        if ([key isKindOfClass:NSString.class] &&
+            [(NSString *)key caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame &&
+            [obj isKindOfClass:NSString.class]) {
+            ua = obj;
+            *stop = YES;
+        }
+    }];
+    // 请求头没有时，再看 session 配置级 UA（HTTPAdditionalHeaders）
+    if (![ua isKindOfClass:NSString.class] && session) {
+        @try {
+            id sh = session.configuration.HTTPAdditionalHeaders[@"User-Agent"];
+            if ([sh isKindOfClass:NSString.class]) ua = sh;
+        } @catch (__unused NSException *e) {}
+    }
+    if (![ua isKindOfClass:NSString.class] || !NDUAContainsReal(ua, c)) return req;
+    NSString *newUA = NDRewriteUA(ua, c);
+    if ([newUA isEqualToString:ua]) return req;
+    NSMutableURLRequest *m = nil;
+    g_nduInRewrite++;
+    @try {
+        m = [req mutableCopy];
+        [m setValue:newUA forHTTPHeaderField:@"User-Agent"];
+    } @catch (__unused NSException *e) {
+        m = nil;
+    } @finally {
+        g_nduInRewrite--;
+    }
+    return m ?: req;
+}
+
+static id ndu_tr_dt1(id self, SEL _cmd, NSURLRequest *req) {
+    NDConfig *c = NDCurrentConfig();
+    NSURLRequest *r = NDURewriteRequest(req, (NSURLSession *)self, c);
+    return ((id(*)(id, SEL, id))objc_msgSend)(self, g_nduSelDt1, r);
+}
+static id ndu_tr_dt2(id self, SEL _cmd, NSURLRequest *req, id handler) {
+    NDConfig *c = NDCurrentConfig();
+    NSURLRequest *r = NDURewriteRequest(req, (NSURLSession *)self, c);
+    return ((id(*)(id, SEL, id, id))objc_msgSend)(self, g_nduSelDt2, r, handler);
+}
+static void ndu_tr_conn(id cls, SEL _cmd, NSURLRequest *req, id queue, id handler) {
+    NDConfig *c = NDCurrentConfig();
+    NSURLRequest *r = NDURewriteRequest(req, nil, c);
+    ((void(*)(id, SEL, id, id, id))objc_msgSend)(cls, g_nduSelConn, r, queue, handler);
+}
+
+static BOOL g_nduStarted = NO;
+static int g_nduTries = 0;
+
+static void NDUScanPass(void) {
+    @try {
+        // 1. WKWebView setCustomUserAgent:
+        Class wk = NSClassFromString(@"WKWebView");
+        if (wk) {
+            Method m = NDUOwnMethod(wk, @selector(setCustomUserAgent:));
+            if (m) NDUSwap(wk, @selector(setCustomUserAgent:), (IMP)ndu_tr_wkSetUA,
+                           g_nduSelWkSetUA, method_getTypeEncoding(m));
+        }
+        // 2. BDPUserAgent webViewDefaultUserAgent（裸前缀源头）
+        Class bdp = NSClassFromString(@"BDPUserAgent");
+        if (bdp) {
+            SEL s = NSSelectorFromString(@"webViewDefaultUserAgent");
+            Method m = NDUOwnMethod(bdp, s);
+            if (m) NDUSwap(bdp, s, (IMP)ndu_tr_wkDefaultUA, g_nduSelWkDefaultUA,
+                           method_getTypeEncoding(m));
+        }
+        // 3. NSMutableURLRequest 类簇：临时实例定位具体实现类
+        Class reqCls = NSClassFromString(@"NSMutableURLRequest");
+        if (reqCls) {
+            @try {
+                NSMutableURLRequest *tmp = [[NSMutableURLRequest alloc]
+                    initWithURL:[NSURL URLWithString:@"http://127.0.0.1/"]];
+                Class concrete = object_getClass(tmp);
+                Method m = NDUOwnMethod(concrete, @selector(setValue:forHTTPHeaderField:));
+                if (m) NDUSwap(concrete, @selector(setValue:forHTTPHeaderField:),
+                               (IMP)ndu_tr_setHdr, g_nduSelSetHdr, method_getTypeEncoding(m));
+                if (concrete != reqCls) {
+                    Method m2 = NDUOwnMethod(reqCls, @selector(setValue:forHTTPHeaderField:));
+                    if (m2) NDUSwap(reqCls, @selector(setValue:forHTTPHeaderField:),
+                                    (IMP)ndu_tr_setHdr, g_nduSelSetHdr, method_getTypeEncoding(m2));
+                }
+            } @catch (__unused NSException *e) {}
+        }
+        // 4. NSURLSession 及其子类（类簇扫描）
+        Class sess = NSClassFromString(@"NSURLSession");
+        if (sess) {
+            unsigned int n = 0;
+            Class *classes = objc_copyClassList(&n);
+            if (classes) {
+                for (unsigned int i = 0; i < n; i++) {
+                    Class cc = classes[i];
+                    if (!NDUIsSubclassOrSame(cc, sess)) continue;
+                    Method m1 = NDUOwnMethod(cc, @selector(dataTaskWithRequest:));
+                    if (m1) NDUSwap(cc, @selector(dataTaskWithRequest:),
+                                    (IMP)ndu_tr_dt1, g_nduSelDt1, method_getTypeEncoding(m1));
+                    Method m2 = NDUOwnMethod(cc, @selector(dataTaskWithRequest:completionHandler:));
+                    if (m2) NDUSwap(cc, @selector(dataTaskWithRequest:completionHandler:),
+                                    (IMP)ndu_tr_dt2, g_nduSelDt2, method_getTypeEncoding(m2));
+                }
+                free(classes);
+            }
+        }
+        // NSURLConnection 异步类方法（metaclass）
+        Class conn = NSClassFromString(@"NSURLConnection");
+        if (conn) {
+            Class meta = object_getClass(conn);
+            Method m3 = NDUOwnMethod(meta, @selector(sendAsynchronousRequest:queue:completionHandler:));
+            if (m3) NDUSwap(meta, @selector(sendAsynchronousRequest:queue:completionHandler:),
+                            (IMP)ndu_tr_conn, g_nduSelConn, method_getTypeEncoding(m3));
+        }
+    } @catch (__unused NSException *e) {}
+    if (++g_nduTries < 60)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ NDUScanPass(); });
+}
+
+static void NDInstallUAExits(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_nduStarted) return;
+        g_nduStarted = YES;
+        g_nduSelWkSetUA = sel_registerName("ndu_orig_wkSetUA:");
+        g_nduSelWkDefaultUA = sel_registerName("ndu_orig_wkDefaultUA");
+        g_nduSelSetHdr = sel_registerName("ndu_orig_setHdr::");
+        g_nduSelDt1 = sel_registerName("ndu_orig_dt1:");
+        g_nduSelDt2 = sel_registerName("ndu_orig_dt2::");
+        g_nduSelConn = sel_registerName("ndu_orig_conn:::");
+        NDUScanPass();
+    });
+}
+
 static void NDStartObjCHooks(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         NDInstallAll();
         _dyld_register_func_for_add_image(NDAddImageCB);
         NDScheduleRetry();
+        NDInstallUAExits();
     });
 }
 
@@ -722,7 +967,7 @@ static UIViewController *NDTopVC(void) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.19-02\n\n"];
+    [r appendFormat:@"NDSpoofer 9.20-01\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",

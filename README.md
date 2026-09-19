@@ -1,9 +1,9 @@
-# NDSpoofer 9.19-02（百度网盘设备指纹伪装）
+# NDSpoofer 9.20-01（百度网盘设备指纹伪装）
 
 两个产物：
 
-- **NDSpoofer_9.19-02.dylib（卐解）**：TrollFools 注入百度网盘（com.baidu.netdisk）。
-- **NDSpooferCraneManager_9.19-02_RootHide.deb（网盘解/卍解）**：RootHide 管理器，为每个 Crane 容器写入独立配置。
+- **NDSpoofer_9.20-01.dylib（卐解）**：TrollFools 注入百度网盘（com.baidu.netdisk）。
+- **NDSpooferCraneManager_9.20-01_RootHide.deb（网盘解/卍解）**：RootHide 管理器，为每个 Crane 容器写入独立配置。
 
 ## 工作流程
 
