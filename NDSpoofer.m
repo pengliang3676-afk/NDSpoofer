@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.20-03
+//  版本：9.20-04
 //
 //  9.20-03 新增（NDProbe4 证据：NADSplash 启动日志 / sofire 风控经 NSProcessInfo 读取真机
 //  物理内存与系统版本，绕过 sysctl 与 UIDevice hook，造成 di 与启动日志/风控的内存、系统
@@ -9,6 +9,10 @@
 //   6. hook NSProcessInfo physicalMemory / operatingSystemVersion / operatingSystemVersionString；
 //   7. NSUserDefaults setObject:forKey: 出口收口（NADSplash、sofire dvlwfrqupdt、UA 缓存键）；
 //   8. 悬浮窗自检显示 NSProcessInfo 与 NADSplash/sofire/UA 实际值，便于真机核验。
+//
+//  9.20-04 修正：按 NDProbe4 实测，NADSplash 的 disk 与 sofire 的 dsks 均为 NSString 字节串
+//  （非 NSNumber），统一按字符串类型收口，且仅在容量档位与真机不同时才替换；iPhone 8 与真机
+//  同为 64GB 时保持原值，天然自洽。
 //
 //  设计原则（与探针 NDProbe2/NDProbe3 证据一一对应）：
 //   1. 只在 com.baidu.netdisk 主进程生效，扩展（.appex/PlugIns）不生效。
@@ -442,7 +446,7 @@ static NSNumber *NDFakeMemNumber(NSNumber *orig, uint64_t fakeBytes) {
     }
 }
 
-// NADSplashLatestLogFormationKeyName：systemVersion、physicalMemory 为 NSString 明文。
+// NADSplashLatestLogFormationKeyName：systemVersion、physicalMemory、disk 均为 NSString 明文。
 static NSDictionary *NDRewriteSplashDict(NSDictionary *d, NDConfig *c) {
     NSMutableDictionary *m = d.mutableCopy;
     if (c.systemVersion.length) {
@@ -454,10 +458,17 @@ static NSDictionary *NDRewriteSplashDict(NSDictionary *d, NDConfig *c) {
         if ([pm isKindOfClass:NSString.class])
             m[@"physicalMemory"] = [NSString stringWithFormat:@"%llu", (uint64_t)c.memorySizeMB * 1024ULL * 1024ULL];
     }
+    // disk 为磁盘字节字符串；仅当档案容量档位与真机不同才替换（iPhone 8 与真机同为 64GB 时保持原值）
+    if (c.diskSizeGB > 0 && c.realDiskBytes > 0) {
+        id dk = m[@"disk"];
+        uint64_t realDiskGB = (c.realDiskBytes + 500000000ULL) / 1000000000ULL;
+        if ([dk isKindOfClass:NSString.class] && (NSInteger)realDiskGB != c.diskSizeGB)
+            m[@"disk"] = [NSString stringWithFormat:@"%lld", (long long)c.diskSizeGB * 1024LL * 1024LL * 1024LL];
+    }
     return m;
 }
 
-// dvlwfrqupdt（sofire）：hwphysm 为内存字节（int32 截断），dsks 为磁盘字节（仅档位不同才改）。
+// dvlwfrqupdt（sofire）：hwphysm 为 NSNumber（int32 截断），dsks 为 NSString 磁盘字节（仅档位不同才改）。
 static NSDictionary *NDRewriteSofireDict(NSDictionary *d, NDConfig *c) {
     NSMutableDictionary *m = d.mutableCopy;
     if (c.memorySizeMB > 0) {
@@ -468,8 +479,8 @@ static NSDictionary *NDRewriteSofireDict(NSDictionary *d, NDConfig *c) {
     if (c.diskSizeGB > 0 && c.realDiskBytes > 0) {
         id dsk = m[@"dsks"];
         uint64_t realDiskGB = (c.realDiskBytes + 500000000ULL) / 1000000000ULL;
-        if ([dsk isKindOfClass:NSNumber.class] && (NSInteger)realDiskGB != c.diskSizeGB)
-            m[@"dsks"] = [NSNumber numberWithLongLong:(int64_t)c.diskSizeGB * 1024LL * 1024LL * 1024LL];
+        if ([dsk isKindOfClass:NSString.class] && (NSInteger)realDiskGB != c.diskSizeGB)
+            m[@"dsks"] = [NSString stringWithFormat:@"%lld", (long long)c.diskSizeGB * 1024LL * 1024LL * 1024LL];
     }
     return m;
 }
@@ -1208,7 +1219,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.20-03\n\n"];
+    [r appendFormat:@"NDSpoofer 9.20-04\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -1225,8 +1236,8 @@ static void NDShowReport(void) {
     [r appendFormat:@"\nPASS_CUSTOM_SYS_VER：%@\n", [d stringForKey:@"PASS_CUSTOM_SYS_VER"] ?: @"(未设置)"];
     [r appendFormat:@"PASS_CUSTOM_UA_WK：%@\n", [d stringForKey:@"PASS_CUSTOM_UA_WK"] ?: @"(未设置)"];
 
-    // 9.20-03 通道自检：直接调用会经过 NSProcessInfo hook；读 NSUserDefaults 看到的是出口收口后的实际值。
-    [r appendString:@"\n—— 9.20-03 通道自检 ——\n"];
+    // 9.20-04 通道自检：直接调用会经过 NSProcessInfo hook；读 NSUserDefaults 看到的是出口收口后的实际值。
+    [r appendString:@"\n—— 9.20-04 通道自检 ——\n"];
     NSProcessInfo *pi = [NSProcessInfo processInfo];
     [r appendFormat:@"NSProcessInfo 内存：%lluMB\n", pi.physicalMemory / 1024ULL / 1024ULL];
     [r appendFormat:@"NSProcessInfo 系统：%@\n", pi.operatingSystemVersionString];
