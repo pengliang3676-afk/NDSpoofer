@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.20-01
+//  版本：9.20-02
 //
 //  设计原则（与探针 NDProbe2/NDProbe3 证据一一对应）：
 //   1. 只在 com.baidu.netdisk 主进程生效，扩展（.appex/PlugIns）不生效。
@@ -373,34 +373,45 @@ static NSString *NDRewriteDeviceInfoLine(NSString *s, NDConfig *c) {
     return [NSString stringWithFormat:@"%@_%@", head, c.systemVersion];
 }
 
-// SAPI 明文串（空格分隔）按 token 精确替换：机型、系统版本、总内存(KB)、总磁盘(KB)
+// SAPI 明文设备串以 \x01（SOH）分隔，字段顺序固定（deviceInfoKeyMapper）：
+// [3] PhoneModel、[4] SystemVersion、[20] ram(KB)、[21] internal_memory(KB)。
+// 9.20-02 修正：旧版误按空格切分，真机明文无空格导致整体 no-op，内存/磁盘从未改写，
+// 上报 iPhone10,1（iPhone 8/2GB）却带真机 3GB 内存，服务端设备管理页据此判“未知设备”。
 static NSString *NDRewriteSapiPlain(NSString *s, NDConfig *c) {
     if (![s isKindOfClass:NSString.class] || !s.length) return s;
-    if ([s rangeOfString:@" "].location == NSNotFound) return s;
-    NSMutableArray<NSString *> *tokens = [[s componentsSeparatedByString:@" "] mutableCopy];
+    NSString *sep = @"\x01";
+    if ([s rangeOfString:sep].location == NSNotFound) return s;
+    NSMutableArray<NSString *> *f = [[s componentsSeparatedByString:sep] mutableCopy];
+    if (f.count < 22) return s; // 字段结构不符预期，原样返回，绝不误改
 
-    NSString *realMemKB = c.realMemBytes ? [NSString stringWithFormat:@"%llu", c.realMemBytes / 1024ULL] : nil;
-    NSString *fakeMemKB = c.memorySizeMB > 0 ? [NSString stringWithFormat:@"%ld", (long)c.memorySizeMB * 1024L] : nil;
-    NSString *realDiskKB = c.realDiskBytes ? [NSString stringWithFormat:@"%llu", c.realDiskBytes / 1024ULL] : nil;
-    NSString *fakeDiskKB = c.diskSizeGB > 0 ? [NSString stringWithFormat:@"%lld", (long long)c.diskSizeGB * 1024LL * 1024LL] : nil;
-
-    NSRegularExpression *verRx = [NSRegularExpression regularExpressionWithPattern:
-        @"^\\d+\\.\\d+(?:\\.\\d+)?$" options:0 error:nil];
-    for (NSUInteger i = 0; i < tokens.count; i++) {
-        NSString *tok = tokens[i];
-        if (c.realMachine.length && [tok isEqualToString:c.realMachine]) {
-            tokens[i] = c.hwMachine;
-            if (i + 1 < tokens.count &&
-                [verRx firstMatchInString:tokens[i+1] options:0 range:NSMakeRange(0, tokens[i+1].length)] &&
-                [tokens[i+1] isEqualToString:c.realOSVersion]) {
-                tokens[i+1] = c.systemVersion;
-            }
-            continue;
-        }
-        if (realMemKB && fakeMemKB && [tok isEqualToString:realMemKB]) { tokens[i] = fakeMemKB; continue; }
-        if (realDiskKB && fakeDiskKB && [tok isEqualToString:realDiskKB]) { tokens[i] = fakeDiskKB; continue; }
+    // [3] PhoneModel：兜底（底层 UIDevice/SAPI hook 通常已改）
+    if (c.hwMachine.length && f[3].length && ![f[3] isEqualToString:c.hwMachine]) {
+        f[3] = c.hwMachine;
     }
-    return [tokens componentsJoinedByString:@" "];
+    // [4] SystemVersion：仅当是 数字.数字[.数字] 形态才改
+    if (c.systemVersion.length && f[4].length) {
+        NSRegularExpression *verRx = [NSRegularExpression regularExpressionWithPattern:
+            @"^\\d+\\.\\d+(?:\\.\\d+)?$" options:0 error:nil];
+        if ([verRx firstMatchInString:f[4] options:0 range:NSMakeRange(0, f[4].length)]) {
+            f[4] = c.systemVersion;
+        }
+    }
+    // [20] ram：总内存（KB）。iPhone 8 物理内存 2GB，真机 SE2 为 3GB，
+    // 这是设备管理页判定“未知设备”的核心矛盾，必须按机型改写。
+    if (c.memorySizeMB > 0 && f[20].length &&
+        [f[20] rangeOfString:@"^\\d+$" options:NSRegularExpressionSearch].location != NSNotFound) {
+        f[20] = [NSString stringWithFormat:@"%ld", (long)c.memorySizeMB * 1024L];
+    }
+    // [21] internal_memory：总磁盘（KB）。仅当档案容量档位与真机不同时才改；
+    // 机型池固定 iPhone 8 为 64GB、真机同为 64GB 时保持原值（真实文件系统总容量），天然自洽。
+    if (c.diskSizeGB > 0 && c.realDiskBytes > 0 && f[21].length &&
+        [f[21] rangeOfString:@"^\\d+$" options:NSRegularExpressionSearch].location != NSNotFound) {
+        uint64_t realDiskGB = (c.realDiskBytes + 500000000ULL) / 1000000000ULL;
+        if ((NSInteger)realDiskGB != c.diskSizeGB) {
+            f[21] = [NSString stringWithFormat:@"%lld", (long long)c.diskSizeGB * 1024LL * 1024LL];
+        }
+    }
+    return [f componentsJoinedByString:sep];
 }
 
 // 字典白名单键：只改机型/系统版本承载键
@@ -967,7 +978,7 @@ static UIViewController *NDTopVC(void) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.20-01\n\n"];
+    [r appendFormat:@"NDSpoofer 9.20-02\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",

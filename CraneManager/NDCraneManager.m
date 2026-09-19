@@ -1,7 +1,7 @@
 //
 //  NDCraneManager.m  —  网盘解（卍解）：为百度网盘的 Crane 容器逐容器写入 NDSpoofer 配置
 //
-//  版本：9.20-01
+//  版本：9.20-02
 //
 //  用法：多选容器 → 一键随机网盘身份（每个容器一套独立机型/系统/IDFV）。
 //  机型池只包含与真机同屏（375x667 @2x）的 iPhone 8 / iPhone SE3，避免机型与屏幕矛盾。
@@ -63,7 +63,7 @@ static NSArray<NSDictionary *> *NDDeviceProfiles(void) {
     dispatch_once(&onceToken, ^{
         profiles = @[
             NDDevice(@"iPhone 8", @"iPhone10,1", @"D20AP", @"iPhone8",
-                     @"Apple A11 Bionic", 2048, @[@64, @256], @"15.0", 16),
+                     @"Apple A11 Bionic", 2048, @[@64], @"15.0", 16),
             NDDevice(@"iPhone SE (3rd generation)", @"iPhone14,6", @"D49AP", @"iPhoneSE3",
                      @"Apple A15 Bionic", 4096, @[@64, @128, @256], @"15.4", 18),
         ];
