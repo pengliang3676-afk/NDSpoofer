@@ -1,7 +1,14 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.20-02
+//  版本：9.20-03
+//
+//  9.20-03 新增（NDProbe4 证据：NADSplash 启动日志 / sofire 风控经 NSProcessInfo 读取真机
+//  物理内存与系统版本，绕过 sysctl 与 UIDevice hook，造成 di 与启动日志/风控的内存、系统
+//  版本跨通道矛盾，服务端设备管理页据此判“未知设备”）：
+//   6. hook NSProcessInfo physicalMemory / operatingSystemVersion / operatingSystemVersionString；
+//   7. NSUserDefaults setObject:forKey: 出口收口（NADSplash、sofire dvlwfrqupdt、UA 缓存键）；
+//   8. 悬浮窗自检显示 NSProcessInfo 与 NADSplash/sofire/UA 实际值，便于真机核验。
 //
 //  设计原则（与探针 NDProbe2/NDProbe3 证据一一对应）：
 //   1. 只在 com.baidu.netdisk 主进程生效，扩展（.appex/PlugIns）不生效。
@@ -414,6 +421,109 @@ static NSString *NDRewriteSapiPlain(NSString *s, NDConfig *c) {
     return [f componentsJoinedByString:sep];
 }
 
+// ============================== NSUserDefaults 出口收口（NADSplash / sofire / UA 缓存） ==============================
+// 这些通道在启动时把设备信息打包成字典或 UA 字符串写入 NSUserDefaults，再经网络上报；
+// 即使 NSProcessInfo hook 已改源头，仍可能在 hook 安装前构造、或走内部缓存，故在 setObject 出口兜底。
+// 仅按白名单 key 处理，其余一律原样透传。
+
+// 按原始 NSNumber 的整型类型写入伪装内存字节数，保持与 App 自身编码一致（sofire 为 int32 截断）。
+static NSNumber *NDFakeMemNumber(NSNumber *orig, uint64_t fakeBytes) {
+    const char *t = orig.objCType ?: "";
+    switch (t[0]) {
+        case 'i': return [NSNumber numberWithInt:(int32_t)(uint32_t)fakeBytes];
+        case 'I': return [NSNumber numberWithUnsignedInt:(uint32_t)fakeBytes];
+        case 'l': return [NSNumber numberWithLong:(long)fakeBytes];
+        case 'L': return [NSNumber numberWithUnsignedLong:(unsigned long)fakeBytes];
+        case 'q': return [NSNumber numberWithLongLong:(int64_t)fakeBytes];
+        case 'Q': return [NSNumber numberWithUnsignedLongLong:fakeBytes];
+        case 's': return [NSNumber numberWithShort:(int16_t)(uint16_t)fakeBytes];
+        case 'S': return [NSNumber numberWithUnsignedShort:(uint16_t)fakeBytes];
+        default:  return [NSNumber numberWithLongLong:(int64_t)fakeBytes];
+    }
+}
+
+// NADSplashLatestLogFormationKeyName：systemVersion、physicalMemory 为 NSString 明文。
+static NSDictionary *NDRewriteSplashDict(NSDictionary *d, NDConfig *c) {
+    NSMutableDictionary *m = d.mutableCopy;
+    if (c.systemVersion.length) {
+        id sv = m[@"systemVersion"];
+        if ([sv isKindOfClass:NSString.class]) m[@"systemVersion"] = c.systemVersion;
+    }
+    if (c.memorySizeMB > 0) {
+        id pm = m[@"physicalMemory"];
+        if ([pm isKindOfClass:NSString.class])
+            m[@"physicalMemory"] = [NSString stringWithFormat:@"%llu", (uint64_t)c.memorySizeMB * 1024ULL * 1024ULL];
+    }
+    return m;
+}
+
+// dvlwfrqupdt（sofire）：hwphysm 为内存字节（int32 截断），dsks 为磁盘字节（仅档位不同才改）。
+static NSDictionary *NDRewriteSofireDict(NSDictionary *d, NDConfig *c) {
+    NSMutableDictionary *m = d.mutableCopy;
+    if (c.memorySizeMB > 0) {
+        id pm = m[@"hwphysm"];
+        if ([pm isKindOfClass:NSNumber.class])
+            m[@"hwphysm"] = NDFakeMemNumber(pm, (uint64_t)c.memorySizeMB * 1024ULL * 1024ULL);
+    }
+    if (c.diskSizeGB > 0 && c.realDiskBytes > 0) {
+        id dsk = m[@"dsks"];
+        uint64_t realDiskGB = (c.realDiskBytes + 500000000ULL) / 1000000000ULL;
+        if ([dsk isKindOfClass:NSNumber.class] && (NSInteger)realDiskGB != c.diskSizeGB)
+            m[@"dsks"] = [NSNumber numberWithLongLong:(int64_t)c.diskSizeGB * 1024LL * 1024LL * 1024LL];
+    }
+    return m;
+}
+
+// BBAUserAgentCheckInfoKey 形态为 “_iPhone10,1_16.3”（机型_版本），尾部版本段替换；其余 UA 走通用改写。
+static NSString *NDRewriteCachedUA(NSString *s, NDConfig *c, BOOL isCheckInfo) {
+    if (![s isKindOfClass:NSString.class] || !s.length) return s;
+    if (isCheckInfo) {
+        NSRange under = [s rangeOfString:@"_" options:NSBackwardsSearch];
+        if (under.location == NSNotFound || under.location + 1 >= s.length) return s;
+        NSString *tail = [s substringFromIndex:under.location];
+        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"^_\\d+(?:\\.\\d+)+$"
+                                                                           options:0 error:nil];
+        if (![rx firstMatchInString:tail options:0 range:NSMakeRange(0, tail.length)]) return s;
+        return [[s substringToIndex:under.location] stringByAppendingFormat:@"_%@", c.systemVersion];
+    }
+    // 仅当仍含真机机型/系统标记时才改写，避免对无关 UA 误改
+    BOOL needs = NO;
+    if (c.realMachine.length &&
+        ([s containsString:c.realMachine] || [s containsString:NDMachineEncoded(c.realMachine)]))
+        needs = YES;
+    if (c.realOSVersion.length && [s containsString:c.realOSVersion]) needs = YES;
+    NSString *realUnder = [c.realOSVersion stringByReplacingOccurrencesOfString:@"." withString:@"_"];
+    if (realUnder.length && [s containsString:[NSString stringWithFormat:@"OS %@ like", realUnder]])
+        needs = YES;
+    return needs ? NDRewriteUA(s, c) : s;
+}
+
+// 按 key 白名单分发；非目标 key 返回原值。
+static id NDRewriteDefaultsValue(NSString *key, id value, NDConfig *c) {
+    if (![key isKindOfClass:NSString.class]) return value;
+    if ([key isEqualToString:@"NADSplashLatestLogFormationKeyName"]) {
+        if ([value isKindOfClass:NSDictionary.class]) return NDRewriteSplashDict((NSDictionary *)value, c);
+        return value;
+    }
+    if ([key isEqualToString:@"dvlwfrqupdt"]) {
+        if ([value isKindOfClass:NSDictionary.class]) return NDRewriteSofireDict((NSDictionary *)value, c);
+        return value;
+    }
+    if ([key isEqualToString:@"BBAUserAgentCheckInfoKey"]) {
+        if ([value isKindOfClass:NSString.class]) return NDRewriteCachedUA(value, c, YES);
+        return value;
+    }
+    static NSSet *uaKeys;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        uaKeys = [NSSet setWithArray:@[@"BBAUserAgentKey", @"GDTDefaultUA",
+                                       @"NADCustomUserAgentKey", @"NADUserAgentKey"]];
+    });
+    if ([uaKeys containsObject:key] && [value isKindOfClass:NSString.class])
+        return NDRewriteCachedUA(value, c, NO);
+    return value;
+}
+
 // 字典白名单键：只改机型/系统版本承载键
 static NSSet<NSString *> *NDSapiDictKeys(void) {
     static NSSet *keys;
@@ -465,6 +575,9 @@ static IMP nd_o_sapiRetrieve = NULL;
 static IMP nd_o_sapiGenerate = NULL;
 static IMP nd_o_uaGet = NULL;
 static IMP nd_o_uaCompose = NULL;
+static IMP nd_o_physMem = NULL;       // NSProcessInfo physicalMemory
+static IMP nd_o_osVerString = NULL;  // NSProcessInfo operatingSystemVersionString
+static IMP nd_o_osVer = NULL;        // NSProcessInfo operatingSystemVersion（结构体返回）
 
 static int g_installed = 0;
 static int g_installAttempts = 0;
@@ -514,6 +627,44 @@ static NSUUID *nd_hook_idfv(id self, SEL _cmd) {
     }
     return nd_o_idfv ? ((NSUUID *(*)(id, SEL))nd_o_idfv)(self, _cmd)
                      : [UIDevice currentDevice].identifierForVendor;
+}
+
+// --- NSProcessInfo（NADSplash 启动日志 / sofire 风控的物理内存与系统版本来源；
+//     这两个通道不走 sysctl / UIDevice，9.20-02 前漏改，上报真机 3GB 与 16.3） ---
+static unsigned long long nd_hook_physMem(id self, SEL _cmd) {
+    NDConfig *c = NDCurrentConfig();
+    if (c.enabled && c.spoofBaiduSDK && c.memorySizeMB > 0)
+        return (unsigned long long)c.memorySizeMB * 1024ULL * 1024ULL;
+    // 原 IMP 缺失时回真机基线，禁止再调 .physicalMemory（会递归回本 hook）
+    return nd_o_physMem ? ((unsigned long long (*)(id, SEL))nd_o_physMem)(self, _cmd)
+                       : c.realMemBytes;
+}
+static NSString *nd_hook_osVerString(id self, SEL _cmd) {
+    NDConfig *c = NDCurrentConfig();
+    if (c.enabled && c.spoofBaiduSDK && c.systemVersion.length) {
+        NSString *build = c.systemBuild.length ? c.systemBuild : @"";
+        return [NSString stringWithFormat:@"Version %@ (Build %@)", c.systemVersion, build];
+    }
+    return nd_o_osVerString ? ((NSString *(*)(id, SEL))nd_o_osVerString)(self, _cmd)
+                           : (c.realOSVersion.length ? c.realOSVersion : @"");
+}
+// NSOperatingSystemVersion 为 24 字节（3×NSInteger），arm64 走 sret；
+// 函数指针按“返回该结构体”声明，编译器自动应用 sret ABI，禁止改成返回标量。
+static NSOperatingSystemVersion nd_hook_osVer(id self, SEL _cmd) {
+    NDConfig *c = NDCurrentConfig();
+    if (c.enabled && c.spoofBaiduSDK && c.systemVersion.length) {
+        NSArray<NSString *> *p = [c.systemVersion componentsSeparatedByString:@"."];
+        NSOperatingSystemVersion v = {0, 0, 0};
+        if (p.count >= 1) v.majorVersion = [p[0] integerValue];
+        if (p.count >= 2) v.minorVersion = [p[1] integerValue];
+        if (p.count >= 3) v.patchVersion = [p[2] integerValue];
+        return v;
+    }
+    if (nd_o_osVer) {
+        return ((NSOperatingSystemVersion (*)(id, SEL))nd_o_osVer)(self, _cmd);
+    }
+    NSOperatingSystemVersion z = {0, 0, 0};
+    return z;
 }
 
 // --- SAPIDeviceInfoHelper ---
@@ -618,6 +769,23 @@ static void NDInstallOne(NSString *clsName, SEL sel, BOOL isClass,
     g_installed++;
 }
 
+// operatingSystemVersion 返回 24 字节结构体（arm64 sret），单独安装并严格校验类型编码，
+// 只在确为 3 个 64 位整型字段（{...=qqq}）时替换，避免结构体 ABI 错位。
+static void NDInstallOSVersionStruct(void) {
+    if (nd_o_osVer) return;
+    Class cls = NSClassFromString(@"NSProcessInfo");
+    if (!cls) return;
+    SEL sel = @selector(operatingSystemVersion);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    const char *types = method_getTypeEncoding(m);
+    if (!types || types[0] != '{') return;
+    if (method_getNumberOfArguments(m) - 2 != 0) return;
+    if (!strstr(types, "qqq")) return;
+    nd_o_osVer = method_setImplementation(m, (IMP)nd_hook_osVer);
+    g_installed++;
+}
+
 static void NDInstallAll(void) {
     // UIDevice 实例方法（含 category：platform/bdc_platformString/bba_cachedSystemVersion）
     NDInstallOne(@"UIDevice", @selector(systemVersion), NO, '@', 0, "",
@@ -656,6 +824,13 @@ static void NDInstallAll(void) {
                  (IMP)nd_hook_uaGet, &nd_o_uaGet);
     NDInstallOne(@"BDPUserAgent", NSSelectorFromString(@"composeUserAgentParameterWithOrigin:shouldEncodeURI:"), NO,
                  '@', 2, "@B", (IMP)nd_hook_uaCompose, &nd_o_uaCompose);
+
+    // NSProcessInfo：NADSplash 启动日志 / sofire 风控的物理内存与系统版本来源
+    NDInstallOne(@"NSProcessInfo", @selector(physicalMemory), NO,
+                 'Q', 0, "", (IMP)nd_hook_physMem, &nd_o_physMem);
+    NDInstallOne(@"NSProcessInfo", @selector(operatingSystemVersionString), NO,
+                 '@', 0, "", (IMP)nd_hook_osVerString, &nd_o_osVerString);
+    NDInstallOSVersionStruct();
 }
 
 static volatile int g_ndDrainQueued = 0;
@@ -751,6 +926,7 @@ static SEL g_nduSelSetHdr = NULL;
 static SEL g_nduSelDt1 = NULL;
 static SEL g_nduSelDt2 = NULL;
 static SEL g_nduSelConn = NULL;
+static SEL g_nduSelUdSet = NULL;
 
 // 1) -[WKWebView setCustomUserAgent:]：改写入参再下发
 static void ndu_tr_wkSetUA(id self, SEL _cmd, id ua) {
@@ -835,6 +1011,20 @@ static void ndu_tr_conn(id cls, SEL _cmd, NSURLRequest *req, id queue, id handle
     ((void(*)(id, SEL, id, id, id))objc_msgSend)(cls, g_nduSelConn, r, queue, handler);
 }
 
+// 5) NSUserDefaults setObject:forKey: 出口：NADSplash / sofire / UA 缓存键收口；非目标 key 立即透传。
+static void ndu_tr_udSet(id self, SEL _cmd, id value, id key) {
+    id out = value;
+    NDConfig *c = NDCurrentConfig();
+    if (g_nduInRewrite == 0 && c.enabled && c.spoofBaiduSDK &&
+        [key isKindOfClass:NSString.class]) {
+        @try {
+            id rewritten = NDRewriteDefaultsValue((NSString *)key, value, c);
+            if (rewritten != value) out = rewritten;
+        } @catch (__unused NSException *e) {}
+    }
+    ((void(*)(id, SEL, id, id))objc_msgSend)(self, g_nduSelUdSet, out, key);
+}
+
 static BOOL g_nduStarted = NO;
 static int g_nduTries = 0;
 
@@ -899,6 +1089,25 @@ static void NDUScanPass(void) {
             if (m3) NDUSwap(meta, @selector(sendAsynchronousRequest:queue:completionHandler:),
                             (IMP)ndu_tr_conn, g_nduSelConn, method_getTypeEncoding(m3));
         }
+        // 5. NSUserDefaults 类簇：基类 + 覆盖了 setObject:forKey: 的子类（NADSplash/sofire/UA 缓存出口）
+        Class udBase = NSClassFromString(@"NSUserDefaults");
+        if (udBase) {
+            Method m0 = NDUOwnMethod(udBase, @selector(setObject:forKey:));
+            if (m0) NDUSwap(udBase, @selector(setObject:forKey:), (IMP)ndu_tr_udSet,
+                            g_nduSelUdSet, method_getTypeEncoding(m0));
+            unsigned int ucn = 0;
+            Class *uclasses = objc_copyClassList(&ucn);
+            if (uclasses) {
+                for (unsigned int i = 0; i < ucn; i++) {
+                    Class uc = uclasses[i];
+                    if (uc == udBase || !NDUIsSubclassOrSame(uc, udBase)) continue;
+                    Method mm = NDUOwnMethod(uc, @selector(setObject:forKey:));
+                    if (mm) NDUSwap(uc, @selector(setObject:forKey:), (IMP)ndu_tr_udSet,
+                                    g_nduSelUdSet, method_getTypeEncoding(mm));
+                }
+                free(uclasses);
+            }
+        }
     } @catch (__unused NSException *e) {}
     if (++g_nduTries < 60)
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
@@ -915,8 +1124,19 @@ static void NDInstallUAExits(void) {
         g_nduSelDt1 = sel_registerName("ndu_orig_dt1:");
         g_nduSelDt2 = sel_registerName("ndu_orig_dt2::");
         g_nduSelConn = sel_registerName("ndu_orig_conn:::");
+        g_nduSelUdSet = sel_registerName("ndu_orig_udSet::");
         NDUScanPass();
     });
+}
+
+// 启动期最关键的物理内存/系统版本来源：在 constructor 同步安装，早于网络库构造 NADSplash/sofire；
+// 主队列 NDInstallAll 内有 outOrig 防重复，不会二次安装。
+static void NDEarlyInstall(void) {
+    NDInstallOne(@"NSProcessInfo", @selector(physicalMemory), NO,
+                 'Q', 0, "", (IMP)nd_hook_physMem, &nd_o_physMem);
+    NDInstallOne(@"NSProcessInfo", @selector(operatingSystemVersionString), NO,
+                 '@', 0, "", (IMP)nd_hook_osVerString, &nd_o_osVerString);
+    NDInstallOSVersionStruct();
 }
 
 static void NDStartObjCHooks(void) {
@@ -975,10 +1195,20 @@ static UIViewController *NDTopVC(void) {
     return vc;
 }
 
+static NSString *NDShortUA(NSString *ua) {
+    if (![ua isKindOfClass:NSString.class] || !ua.length) return @"(未写入)";
+    NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:
+        @"CPU iPhone OS [0-9_]+|Baidu; P2 [0-9.]+|_[0-9]+\.[0-9]+(?:\.[0-9]+)?"
+                                                                       options:0 error:nil];
+    NSTextCheckingResult *m = [rx firstMatchInString:ua options:0 range:NSMakeRange(0, ua.length)];
+    if (m) return [ua substringWithRange:m.range];
+    return ua.length > 48 ? [[ua substringToIndex:48] stringByAppendingString:@"…"] : ua;
+}
+
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.20-02\n\n"];
+    [r appendFormat:@"NDSpoofer 9.20-03\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -994,6 +1224,30 @@ static void NDShowReport(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     [r appendFormat:@"\nPASS_CUSTOM_SYS_VER：%@\n", [d stringForKey:@"PASS_CUSTOM_SYS_VER"] ?: @"(未设置)"];
     [r appendFormat:@"PASS_CUSTOM_UA_WK：%@\n", [d stringForKey:@"PASS_CUSTOM_UA_WK"] ?: @"(未设置)"];
+
+    // 9.20-03 通道自检：直接调用会经过 NSProcessInfo hook；读 NSUserDefaults 看到的是出口收口后的实际值。
+    [r appendString:@"\n—— 9.20-03 通道自检 ——\n"];
+    NSProcessInfo *pi = [NSProcessInfo processInfo];
+    [r appendFormat:@"NSProcessInfo 内存：%lluMB\n", pi.physicalMemory / 1024ULL / 1024ULL];
+    [r appendFormat:@"NSProcessInfo 系统：%@\n", pi.operatingSystemVersionString];
+    NSOperatingSystemVersion osv = pi.operatingSystemVersion;
+    [r appendFormat:@"NSProcessInfo 版本：%ld.%ld.%ld\n",
+        (long)osv.majorVersion, (long)osv.minorVersion, (long)osv.patchVersion];
+    id splash = [d objectForKey:@"NADSplashLatestLogFormationKeyName"];
+    if ([splash isKindOfClass:NSDictionary.class]) {
+        NSDictionary *sd = (NSDictionary *)splash;
+        [r appendFormat:@"NADSplash 系统/内存：%@ / %@\n", sd[@"systemVersion"] ?: @"-", sd[@"physicalMemory"] ?: @"-"];
+    } else {
+        [r appendString:@"NADSplash：(尚未写入)\n"];
+    }
+    id sofire = [d objectForKey:@"dvlwfrqupdt"];
+    if ([sofire isKindOfClass:NSDictionary.class]) {
+        [r appendFormat:@"sofire hwphysm：%@\n", ((NSDictionary *)sofire)[@"hwphysm"] ?: @"-"];
+    } else {
+        [r appendString:@"sofire：(尚未写入)\n"];
+    }
+    [r appendFormat:@"NAD UA：%@\n", NDShortUA([d stringForKey:@"NADUserAgentKey"])];
+    [r appendFormat:@"BBA Check：%@\n", [d stringForKey:@"BBAUserAgentCheckInfoKey"] ?: @"(未写入)"];
 
     UIActivityViewController *ac = [[UIActivityViewController alloc] initWithActivityItems:@[r]
                                                                       applicationActivities:nil];
@@ -1055,6 +1309,7 @@ static void nd_constructor(void) {
         NDConfig *c = NDCurrentConfig();
         if (!c.enabled) return;
         NDSeedPassCustom(c);
+        NDEarlyInstall();
         NDStartObjCHooks();
         NDSetupFloatButton();
 
