@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.20-04
+//  版本：9.20-05
 //
 //  9.20-03 新增（NDProbe4 证据：NADSplash 启动日志 / sofire 风控经 NSProcessInfo 读取真机
 //  物理内存与系统版本，绕过 sysctl 与 UIDevice hook，造成 di 与启动日志/风控的内存、系统
@@ -13,6 +13,12 @@
 //  9.20-04 修正：按 NDProbe4 实测，NADSplash 的 disk 与 sofire 的 dsks 均为 NSString 字节串
 //  （非 NSNumber），统一按字符串类型收口，且仅在容量档位与真机不同时才替换；iPhone 8 与真机
 //  同为 64GB 时保持原值，天然自洽。
+//
+//  9.20-05 修正（真机自检证据）：9.20-03/04 的 NSUserDefaults 出口与 UIDevice 等 hook 装在主队列
+//  async，晚于 NADSplash/sofire/UA 缓存的启动期首次写入，导致真机 16.3/3GB 落盘（自检中
+//  NSProcessInfo 已伪装但 NADSplash.systemVersion、sofire.hwphysm、NAD UA、BBA Check 仍为真机值）。
+//  现把 NDInstallAll（UIDevice/NSProcessInfo/SAPI/BDPUserAgent）与 NSUserDefaults 出口全部提前到
+//  constructor 同步安装（与探针 NDProbe4 的 +load 抢早时机一致），主队列仅保留 dyld 回调与重试兜底。
 //
 //  设计原则（与探针 NDProbe2/NDProbe3 证据一一对应）：
 //   1. 只在 com.baidu.netdisk 主进程生效，扩展（.appex/PlugIns）不生效。
@@ -1140,14 +1146,36 @@ static void NDInstallUAExits(void) {
     });
 }
 
-// 启动期最关键的物理内存/系统版本来源：在 constructor 同步安装，早于网络库构造 NADSplash/sofire；
-// 主队列 NDInstallAll 内有 outOrig 防重复，不会二次安装。
+// NSUserDefaults 出口必须在 constructor 同步安装：NADSplash/sofire/UA 缓存均在 App 启动早期
+// （主队列 block 之前）经 setObject:forKey: 写入，装晚了会错过首次写入，让真机值落盘。
+// 基类 + 当前已加载且自身实现 setObject 的子类；晚加载子类由主队列 NDUScanPass 重试补齐（幂等）。
+static void NDEarlyInstallDefaults(void) {
+    Class udBase = NSClassFromString(@"NSUserDefaults");
+    if (!udBase) return;
+    if (!g_nduSelUdSet) g_nduSelUdSet = sel_registerName("ndu_orig_udSet::");
+    Method m0 = NDUOwnMethod(udBase, @selector(setObject:forKey:));
+    if (m0) NDUSwap(udBase, @selector(setObject:forKey:), (IMP)ndu_tr_udSet,
+                    g_nduSelUdSet, method_getTypeEncoding(m0));
+    unsigned int ucn = 0;
+    Class *uclasses = objc_copyClassList(&ucn);
+    if (uclasses) {
+        for (unsigned int i = 0; i < ucn; i++) {
+            Class uc = uclasses[i];
+            if (uc == udBase || !NDUIsSubclassOrSame(uc, udBase)) continue;
+            Method mm = NDUOwnMethod(uc, @selector(setObject:forKey:));
+            if (mm) NDUSwap(uc, @selector(setObject:forKey:), (IMP)ndu_tr_udSet,
+                            g_nduSelUdSet, method_getTypeEncoding(mm));
+        }
+        free(uclasses);
+    }
+}
+
+// 启动期 hook 全部在 constructor 同步安装，抢在 App 网络库构造 NADSplash/sofire/UA 缓存之前：
+// NDInstallAll 覆盖 UIDevice/NSProcessInfo/SAPI/BDPUserAgent，NDEarlyInstallDefaults 覆盖
+// NSUserDefaults 出口；主队列 NDStartObjCHooks 仍做 dyld 回调与重试兜底，安装均幂等。
 static void NDEarlyInstall(void) {
-    NDInstallOne(@"NSProcessInfo", @selector(physicalMemory), NO,
-                 'Q', 0, "", (IMP)nd_hook_physMem, &nd_o_physMem);
-    NDInstallOne(@"NSProcessInfo", @selector(operatingSystemVersionString), NO,
-                 '@', 0, "", (IMP)nd_hook_osVerString, &nd_o_osVerString);
-    NDInstallOSVersionStruct();
+    NDInstallAll();
+    NDEarlyInstallDefaults();
 }
 
 static void NDStartObjCHooks(void) {
@@ -1219,7 +1247,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.20-04\n\n"];
+    [r appendFormat:@"NDSpoofer 9.20-05\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -1236,8 +1264,8 @@ static void NDShowReport(void) {
     [r appendFormat:@"\nPASS_CUSTOM_SYS_VER：%@\n", [d stringForKey:@"PASS_CUSTOM_SYS_VER"] ?: @"(未设置)"];
     [r appendFormat:@"PASS_CUSTOM_UA_WK：%@\n", [d stringForKey:@"PASS_CUSTOM_UA_WK"] ?: @"(未设置)"];
 
-    // 9.20-04 通道自检：直接调用会经过 NSProcessInfo hook；读 NSUserDefaults 看到的是出口收口后的实际值。
-    [r appendString:@"\n—— 9.20-04 通道自检 ——\n"];
+    // 9.20-05 通道自检：直接调用会经过 NSProcessInfo hook；读 NSUserDefaults 看到的是出口收口后的实际值。
+    [r appendString:@"\n—— 9.20-05 通道自检 ——\n"];
     NSProcessInfo *pi = [NSProcessInfo processInfo];
     [r appendFormat:@"NSProcessInfo 内存：%lluMB\n", pi.physicalMemory / 1024ULL / 1024ULL];
     [r appendFormat:@"NSProcessInfo 系统：%@\n", pi.operatingSystemVersionString];
