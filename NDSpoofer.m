@@ -1,7 +1,10 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-04
+//  版本：9.21-05
+//
+//  9.21-05：悬浮球标题改为「网解」；只在 SAPI 登录成功回调后等 15 秒再收边。
+//  等验证码、短信页、登录 WebView 期间不算登录，球保持展开。登出后重新展开。
 //
 //  9.21-04：账号与安全→登录设备仍「未知设备」（设置→设备管理已是 iPhone15Pro）。
 //  登录页在 PASSWebView（自有 loadRequest / initWKWebView），常用非持久 WKWebsiteDataStore，
@@ -639,6 +642,13 @@ static IMP nd_o_osVer = NULL;        // NSProcessInfo operatingSystemVersion（�
 static IMP nd_o_ebResolution = NULL;        // EBAppLogDeviceHelper +resolution（CGSize 结构体）
 static IMP nd_o_ebResolutionString = NULL;  // EBAppLogDeviceHelper +resolutionString
 static IMP nd_o_ebScreenScale = NULL;       // EBAppLogDeviceHelper +screenScale
+static IMP nd_o_handleLogin = NULL;
+static IMP nd_o_web2Native = NULL;
+static IMP nd_o_loginSuccessful = NULL;
+static IMP nd_o_logoutCurrent = NULL;
+
+static void NDFloatOnLoginSuccess(void);
+static void NDFloatOnLogout(void);
 
 static int g_installed = 0;
 static int g_installAttempts = 0;
@@ -774,6 +784,27 @@ static BOOL nd_hook_sapiNotAllowedDI(id self, SEL _cmd, unsigned long long idx) 
     return nd_o_sapiNotAllowedDI
         ? ((BOOL (*)(id, SEL, unsigned long long))nd_o_sapiNotAllowedDI)(self, _cmd, idx)
         : NO;
+}
+
+static void nd_hook_handleLogin(id self, SEL _cmd, id model, id extra) {
+    if (nd_o_handleLogin)
+        ((void (*)(id, SEL, id, id))nd_o_handleLogin)(self, _cmd, model, extra);
+    NDFloatOnLoginSuccess();
+}
+static void nd_hook_web2Native(id self, SEL _cmd, id model) {
+    if (nd_o_web2Native)
+        ((void (*)(id, SEL, id))nd_o_web2Native)(self, _cmd, model);
+    NDFloatOnLoginSuccess();
+}
+static void nd_hook_loginSuccessful(id self, SEL _cmd) {
+    if (nd_o_loginSuccessful)
+        ((void (*)(id, SEL))nd_o_loginSuccessful)(self, _cmd);
+    NDFloatOnLoginSuccess();
+}
+static BOOL nd_hook_logoutCurrent(id self, SEL _cmd) {
+    BOOL r = nd_o_logoutCurrent ? ((BOOL (*)(id, SEL))nd_o_logoutCurrent)(self, _cmd) : NO;
+    NDFloatOnLogout();
+    return r;
 }
 
 static int g_ndInSetCookie = 0;
@@ -1110,6 +1141,16 @@ static void NDInstallAll(void) {
                  'v', 0, "", (IMP)nd_hook_sapiSetCookie, &nd_o_sapiSetCookie);
     NDInstallOne(@"SAPIDeviceInfoHelper", NSSelectorFromString(@"notAllowedGetDI:"), YES,
                  'B', 1, "Q", (IMP)nd_hook_sapiNotAllowedDI, &nd_o_sapiNotAllowedDI);
+
+    // 悬浮球收边：只认 SAPI 登录成功 / 登出，不拿 BDUSS、不拿验证码页当登录。
+    NDInstallOne(@"SAPILoginService", NSSelectorFromString(@"handleLoginWithModel:extraInfo:"), NO,
+                 'v', 2, "@@", (IMP)nd_hook_handleLogin, &nd_o_handleLogin);
+    NDInstallOne(@"SAPILoginService", NSSelectorFromString(@"web2NativeLoginWithLoginModel:"), NO,
+                 'v', 1, "@", (IMP)nd_hook_web2Native, &nd_o_web2Native);
+    NDInstallOne(@"PASSWebViewController", NSSelectorFromString(@"loginSuccessful"), NO,
+                 'v', 0, "", (IMP)nd_hook_loginSuccessful, &nd_o_loginSuccessful);
+    NDInstallOne(@"SAPILoginService", NSSelectorFromString(@"logoutCurrentModel"), NO,
+                 'B', 0, "", (IMP)nd_hook_logoutCurrent, &nd_o_logoutCurrent);
 
     // BDPUserAgent 实例方法
     NDInstallOne(@"BDPUserAgent", NSSelectorFromString(@"useagent_getDeviceInfo"), NO, '@', 0, "",
@@ -1605,6 +1646,110 @@ static void NDSeedPassCustom(NDConfig *c) {
 // ============================== 悬浮状态窗（只读自检） ==============================
 
 static UIButton *g_floatBtn = nil;
+static BOOL g_floatDocked = NO;
+static BOOL g_floatDockTimerOn = NO;
+static BOOL g_floatLoginOK = NO;
+static uint32_t g_floatDockGen = 0;
+
+static void NDShowReport(void);
+
+static BOOL NDVCHasLogin(UIViewController *vc) {
+    if (!vc) return NO;
+    NSString *n = NSStringFromClass(vc.class);
+    if ([n containsString:@"PASSWebViewController"] || [n containsString:@"SAPIWebView"])
+        return YES;
+    if (NDVCHasLogin(vc.presentedViewController)) return YES;
+    if ([vc isKindOfClass:UINavigationController.class])
+        return NDVCHasLogin(((UINavigationController *)vc).visibleViewController);
+    if ([vc isKindOfClass:UITabBarController.class])
+        return NDVCHasLogin(((UITabBarController *)vc).selectedViewController);
+    for (UIViewController *c in vc.childViewControllers) {
+        if (NDVCHasLogin(c)) return YES;
+    }
+    return NO;
+}
+
+static BOOL NDLoginUIVisible(void) {
+    UIViewController *root = nil;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class]) continue;
+        if (scene.activationState != UISceneActivationStateForegroundActive) continue;
+        for (UIWindow *win in ((UIWindowScene *)scene).windows) {
+            if (win.isKeyWindow) { root = win.rootViewController; break; }
+        }
+    }
+    if (!root) root = UIApplication.sharedApplication.keyWindow.rootViewController;
+    return NDVCHasLogin(root);
+}
+
+static void NDFloatApplyDock(BOOL docked, BOOL animated) {
+    if (!g_floatBtn) return;
+    g_floatDocked = docked;
+    CGRect r = g_floatBtn.frame;
+    CGFloat peek = 16.0;
+    r.origin.x = docked ? (peek - r.size.width) : 8.0;
+    void (^go)(void) = ^{ g_floatBtn.frame = r; };
+    if (animated) {
+        [UIView animateWithDuration:0.28 delay:0
+                            options:UIViewAnimationOptionCurveEaseInOut
+                         animations:go completion:nil];
+    } else {
+        go();
+    }
+}
+
+static void NDFloatScheduleDock(void) {
+    if (!g_floatBtn || g_floatDocked || g_floatDockTimerOn) return;
+    if (!g_floatLoginOK) return;
+    g_floatDockTimerOn = YES;
+    uint32_t gen = ++g_floatDockGen;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        g_floatDockTimerOn = NO;
+        if (gen != g_floatDockGen) return;
+        if (!g_floatBtn || !g_floatLoginOK) return;
+        NDFloatApplyDock(YES, YES);
+    });
+}
+
+static void NDFloatOnLoginSuccess(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_floatLoginOK = YES;
+        NDFloatScheduleDock();
+    });
+}
+
+static void NDFloatOnLogout(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_floatLoginOK = NO;
+        g_floatDockGen++;
+        g_floatDockTimerOn = NO;
+        NDFloatApplyDock(NO, YES);
+    });
+}
+
+static void NDFloatTapped(void) {
+    g_floatDockGen++;
+    g_floatDockTimerOn = NO;
+    if (g_floatDocked) NDFloatApplyDock(NO, YES);
+    NDShowReport();
+    if (g_floatLoginOK) NDFloatScheduleDock();
+}
+
+static void NDFloatMaybeAlreadyLoggedIn(void) {
+    if (g_floatLoginOK) {
+        NDFloatScheduleDock();
+        return;
+    }
+    if (NDLoginUIVisible()) return;
+    Class cm = NSClassFromString(@"SAPICookieManager");
+    SEL s = NSSelectorFromString(@"getBdussFromCookie");
+    if (!(cm && [cm respondsToSelector:s])) return;
+    id v = ((id (*)(id, SEL))objc_msgSend)(cm, s);
+    if (![v isKindOfClass:NSString.class] || ((NSString *)v).length < 8) return;
+    g_floatLoginOK = YES;
+    NDFloatScheduleDock();
+}
 
 static UIViewController *NDTopVC(void) {
     UIViewController *vc = UIApplication.sharedApplication.keyWindow.rootViewController;
@@ -1785,7 +1930,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-04\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-05\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -1867,12 +2012,12 @@ static void NDSetupFloatButton(void) {
             b.layer.cornerRadius = 28;
             b.layer.masksToBounds = YES;
             b.backgroundColor = [UIColor colorWithRed:0.10 green:0.55 blue:0.95 alpha:0.85];
-            b.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-            b.titleLabel.numberOfLines = 2;
-            [b setTitle:@"网解\n伪装" forState:UIControlStateNormal];
+            b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+            b.titleLabel.numberOfLines = 1;
+            [b setTitle:@"网解" forState:UIControlStateNormal];
             [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
             [b addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
-                NDShowReport();
+                NDFloatTapped();
             }] forControlEvents:UIControlEventTouchUpInside];
             b.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
             UIWindow *w = nil;
@@ -1887,6 +2032,7 @@ static void NDSetupFloatButton(void) {
             if (w) {
                 [w addSubview:b];
                 g_floatBtn = b;
+                NDFloatMaybeAlreadyLoggedIn();
             }
         });
     });
