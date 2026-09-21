@@ -1,7 +1,11 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-13
+//  版本：9.21-14
+//
+//  9.21-14：13 登录 POST /v3/login/api/auth formbody has_di=1 且写入了 PhoneModel，
+//  列表仍未知。客户端已送出。不再改登录 body（避免多余字段干扰）。只读记下加密前
+//  明文 di 的 PhoneModel / SystemVersion / ram / disk，核对是否自洽。不注入 JS。
 //
 //  9.21-13：12 登录当场原生短信=3、Cookie=1、http 已打到 /v3/login/api/auth，
 //  但 addBase/smsBase=0，列表仍未知。extraParams 没进 POST。改为 hook
@@ -503,6 +507,28 @@ static NSString *NDRewriteSapiPlain(NSString *s, NDConfig *c) {
     return [f componentsJoinedByString:sep];
 }
 
+static int g_plainN = 0, g_plainCnt = 0;
+static NSString *g_plainPM = nil, *g_plainVer = nil, *g_plainRam = nil, *g_plainDsk = nil;
+
+static void NDNoteSapiPlainFields(NSString *s) {
+    g_plainN++;
+    if (![s isKindOfClass:NSString.class] || !s.length) {
+        g_plainCnt = 0;
+        return;
+    }
+    NSString *sep = @"\x01";
+    if ([s rangeOfString:sep].location == NSNotFound) {
+        g_plainCnt = 0;
+        return;
+    }
+    NSArray *f = [s componentsSeparatedByString:sep];
+    g_plainCnt = (int)f.count;
+    g_plainPM = f.count > 3 ? [f[3] copy] : nil;
+    g_plainVer = f.count > 4 ? [f[4] copy] : nil;
+    g_plainRam = f.count > 20 ? [f[20] copy] : nil;
+    g_plainDsk = f.count > 21 ? [f[21] copy] : nil;
+}
+
 // ============================== NSUserDefaults 出口收口（NADSplash / sofire / UA 缓存） ==============================
 // 这些通道在启动时把设备信息打包成字典或 UA 字符串写入 NSUserDefaults，再经网络上报；
 // 即使 NSProcessInfo hook 已改源头，仍可能在 hook 安装前构造、或走内部缓存，故在 setObject 出口兜底。
@@ -852,10 +878,11 @@ static NSString *nd_hook_sapiDeviceType(id self, SEL _cmd) {
 static id nd_hook_sapiPlain(id self, SEL _cmd, id interface) {
     id orig = nd_o_sapiPlain ? ((id (*)(id, SEL, id))nd_o_sapiPlain)(self, _cmd, interface) : nil;
     NDConfig *c = NDCurrentConfig();
-    if (c.enabled && c.spoofBaiduSDK && [orig isKindOfClass:NSString.class]) {
-        return NDRewriteSapiPlain(orig, c);
-    }
-    return orig;
+    id out = orig;
+    if (c.enabled && c.spoofBaiduSDK && [orig isKindOfClass:NSString.class])
+        out = NDRewriteSapiPlain(orig, c);
+    if ([out isKindOfClass:NSString.class]) NDNoteSapiPlainFields(out);
+    return out;
 }
 static id nd_hook_sapiRetrieve(id self, SEL _cmd, id keys) {
     id orig = nd_o_sapiRetrieve ? ((id (*)(id, SEL, id))nd_o_sapiRetrieve)(self, _cmd, keys) : nil;
@@ -871,9 +898,9 @@ static id nd_hook_sapiRetrieve(id self, SEL _cmd, id keys) {
 static id nd_hook_sapiGenerate(id self, SEL _cmd, id plain) {
     NDConfig *c = NDCurrentConfig();
     id fed = plain;
-    if (c.enabled && c.spoofBaiduSDK && [plain isKindOfClass:NSString.class]) {
+    if (c.enabled && c.spoofBaiduSDK && [plain isKindOfClass:NSString.class])
         fed = NDRewriteSapiPlain(plain, c);
-    }
+    if ([fed isKindOfClass:NSString.class]) NDNoteSapiPlainFields(fed);
     return nd_o_sapiGenerate ? ((id (*)(id, SEL, id))nd_o_sapiGenerate)(self, _cmd, fed) : fed;
 }
 static BOOL nd_hook_sapiNotAllowedDI(id self, SEL _cmd, unsigned long long idx) {
@@ -1217,67 +1244,15 @@ static NSURLRequest *NDRequestByAddingWapBody(NSURLRequest *req, NSString *via) 
     if (![req isKindOfClass:NSURLRequest.class] || !req.URL) return req;
     NSString *path = (req.URL.path ?: @"").lowercaseString;
     if (!NDURLIsLoginSubmit(req.URL) && ![path containsString:@"/login/api/auth"]) return req;
-    NSDictionary *add = NDWapDeviceDict();
-    if (!add) return req;
     NSData *body = req.HTTPBody;
     if (!body.length || body.length > 1024 * 1024) return req;
-    NSString *ct = nil;
-    for (NSString *k in req.allHTTPHeaderFields) {
-        if ([k caseInsensitiveCompare:@"Content-Type"] == NSOrderedSame) {
-            ct = req.allHTTPHeaderFields[k];
-            break;
-        }
-    }
-    NSString *ctl = (ct ?: @"").lowercaseString;
-    if ([ctl containsString:@"multipart"]) return req;
     NSString *s = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
     if (!s.length) return req;
-    if ([s containsString:@"PhoneModel="] || [s containsString:@"\"PhoneModel\""]) {
-        BOOL hasDi = [s containsString:@"di="] || [s containsString:@"\"di\""];
-        NDNoteWapParam(via, [NSString stringWithFormat:@"body already has_di=%d %@", hasDi ? 1 : 0, NDShortPassURL(req.URL)]);
-        return req;
-    }
-    if ([s hasPrefix:@"{"] || [ctl containsString:@"json"]) {
-        id obj = nil;
-        @try { obj = [NSJSONSerialization JSONObjectWithData:body options:NSJSONReadingMutableContainers error:nil]; }
-        @catch (__unused NSException *e) { obj = nil; }
-        if (![obj isKindOfClass:NSMutableDictionary.class] && [obj isKindOfClass:NSDictionary.class])
-            obj = [obj mutableCopy];
-        if ([obj isKindOfClass:NSMutableDictionary.class]) {
-            NSMutableDictionary *m = (NSMutableDictionary *)obj;
-            [add enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
-                if (![m[k] isKindOfClass:NSString.class] || ![((NSString *)m[k]) length])
-                    m[k] = v;
-            }];
-            NSData *nb = nil;
-            @try { nb = [NSJSONSerialization dataWithJSONObject:m options:0 error:nil]; }
-            @catch (__unused NSException *e) { nb = nil; }
-            if (nb.length) {
-                NSMutableURLRequest *mr = [req mutableCopy];
-                mr.HTTPBody = nb;
-                BOOL hasDi = [m[@"di"] isKindOfClass:NSString.class] && [((NSString *)m[@"di"]) length];
-                NDNoteWapParam(via, [NSString stringWithFormat:@"jsonbody PhoneModel=%@ has_di=%d %@",
-                                     add[@"PhoneModel"], hasDi ? 1 : 0, NDShortPassURL(req.URL)]);
-                return mr;
-            }
-        }
-        return req;
-    }
-    NSMutableArray *parts = [NSMutableArray array];
-    NSCharacterSet *ok = [NSCharacterSet URLQueryAllowedCharacterSet];
-    [add enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
-        NSString *ek = [k stringByAddingPercentEncodingWithAllowedCharacters:ok] ?: k;
-        NSString *ev = [v stringByAddingPercentEncodingWithAllowedCharacters:ok] ?: v;
-        [parts addObject:[NSString stringWithFormat:@"%@=%@", ek, ev]];
-    }];
-    NSString *extra = [parts componentsJoinedByString:@"&"];
-    NSString *ns = [s stringByAppendingFormat:@"%@%@", [s containsString:@"="] ? @"&" : @"", extra];
-    NSMutableURLRequest *mr = [req mutableCopy];
-    mr.HTTPBody = [ns dataUsingEncoding:NSUTF8StringEncoding];
-    BOOL hasDi = [s containsString:@"di="];
-    NDNoteWapParam(via, [NSString stringWithFormat:@"formbody PhoneModel=%@ has_di=%d %@",
-                         add[@"PhoneModel"], hasDi ? 1 : 0, NDShortPassURL(req.URL)]);
-    return mr;
+    BOOL hasDi = [s containsString:@"di="] || [s containsString:@"\"di\""];
+    BOOL hasPM = [s containsString:@"PhoneModel="] || [s containsString:@"\"PhoneModel\""];
+    NDNoteWapParam(via, [NSString stringWithFormat:@"log has_di=%d has_pm=%d %@",
+                         hasDi ? 1 : 0, hasPM ? 1 : 0, NDShortPassURL(req.URL)]);
+    return req;
 }
 
 static void NDSyncDVIFToStore(id store, void (^done)(void)) {
@@ -2541,7 +2516,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-13\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-14\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -2635,7 +2610,7 @@ static void NDShowReport(void) {
     [r appendString:@"读法：di_keys 不含 PhoneModel → H5 登录根本不要机型。\n"];
     [r appendString:@"keys 有 PhoneModel 且回包有值，登录设备仍未知 → Passport 不用这份机型。\n"];
 
-    [r appendString:@"\n—— 登录参数（9.21-13）——\n"];
+    [r appendString:@"\n—— 登录参数（9.21-14）——\n"];
     [r appendFormat:@"写入次数：%d\n", g_wapParamN];
     [r appendFormat:@"wkLoad/passLoad：%d  http登录路径：%d  原生短信：%d\n",
         g_wapViaWk, g_wapViaHttp, g_wapViaSms];
@@ -2644,8 +2619,17 @@ static void NDShowReport(void) {
     [r appendFormat:@"最近出口：%@\n", g_wapParamVia ?: @"(还没写到短信/WAP 参数)"];
     [r appendFormat:@"最近内容：%@\n", g_wapParamLast ?: @"-"];
     [r appendFormat:@"最近 Passport URL：%@\n", g_h5LastURL ?: @"(无)"];
-    [r appendString:@"看最近内容里的 has_di。登录 POST 有 di 仍未知 → Passport 不认这份机型。\n"];
+    [r appendString:@"看最近内容里的 has_di。登录 POST 有 di 仍未知 → 看下面明文字段是否自洽。\n"];
     [r appendString:@"登录后看「登录设备」最新一条。\n"];
+
+    [r appendString:@"\n—— 加密前 di 明文（9.21-14）——\n"];
+    [r appendFormat:@"采样次数：%d  字段数：%d（期望≥22）\n", g_plainN, g_plainCnt];
+    [r appendFormat:@"[3] PhoneModel：%@\n", g_plainPM ?: @"(无)"];
+    [r appendFormat:@"[4] SystemVersion：%@\n", g_plainVer ?: @"(无)"];
+    [r appendFormat:@"[20] ram(KB)：%@\n", g_plainRam ?: @"(无)"];
+    [r appendFormat:@"[21] disk(KB)：%@\n", g_plainDsk ?: @"(无)"];
+    [r appendFormat:@"配置内存：%ldMB  配置磁盘：%ldGB\n", (long)c.memorySizeMB, (long)c.diskSizeGB];
+    [r appendString:@"ram 应对齐 配置内存×1024。对不上就是服务端判未知的老原因。\n"];
 
     NDReportVC *rc = [[NDReportVC alloc] initWithReport:r];
     UIViewController *host = NDFloatHostVC();
