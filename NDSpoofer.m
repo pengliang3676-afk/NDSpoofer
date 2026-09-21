@@ -1,7 +1,12 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-12
+//  版本：9.21-13
+//
+//  9.21-13：12 登录当场原生短信=3、Cookie=1、http 已打到 /v3/login/api/auth，
+//  但 addBase/smsBase=0，列表仍未知。extraParams 没进 POST。改为 hook
+//  SAPIMainManager baseParamsForSMSLogin，并在 login/api/auth 的 HTTP body 写入
+//  PhoneModel（记下 has_di）。不注入 JS。
 //
 //  9.21-12：11 实测短信仍是网页提交，smsWap=0；写入 14 次全是登录后的
 //  passport getuinfo / batch/diff，不是登录 POST。网页 XHR 不走 NSURLSession。
@@ -687,6 +692,8 @@ static IMP nd_o_smsSlim = NULL;
 static IMP nd_o_smsLogin = NULL;
 static IMP nd_o_smsMobile = NULL;
 static IMP nd_o_smsBase = NULL;
+static IMP nd_o_smsBaseMain = NULL;
+static IMP nd_o_smsBaseMgr = NULL;
 
 static NSDictionary *NDMergeWapDict(id extra);
 static NSDictionary *NDMergeWapNamed(id extra, NSString *via);
@@ -1008,6 +1015,14 @@ static id nd_hook_smsBase(id self, SEL _cmd, id iface) {
     id orig = nd_o_smsBase ? ((id (*)(id, SEL, id))nd_o_smsBase)(self, _cmd, iface) : nil;
     return NDMergeWapNamed(orig, @"smsBase");
 }
+static id nd_hook_smsBaseMain(id self, SEL _cmd, id iface) {
+    id orig = nd_o_smsBaseMain ? ((id (*)(id, SEL, id))nd_o_smsBaseMain)(self, _cmd, iface) : nil;
+    return NDMergeWapNamed(orig, @"smsBase");
+}
+static id nd_hook_smsBaseMgr(id self, SEL _cmd, id iface) {
+    id orig = nd_o_smsBaseMgr ? ((id (*)(id, SEL, id))nd_o_smsBaseMgr)(self, _cmd, iface) : nil;
+    return NDMergeWapNamed(orig, @"smsBase");
+}
 
 static int g_ndInSetCookie = 0;
 
@@ -1070,7 +1085,7 @@ static void NDNoteWapParam(NSString *via, NSString *detail) {
     if ([via isEqualToString:@"wkLoad"] || [via isEqualToString:@"passLoad"] ||
         [via isEqualToString:@"sapiLoad"])
         g_wapViaWk++;
-    else if ([via isEqualToString:@"http"])
+    else if ([via isEqualToString:@"http"] || [via isEqualToString:@"httpBody"])
         g_wapViaHttp++;
     else if ([via hasPrefix:@"sms"])
         g_wapViaSms++;
@@ -1092,7 +1107,9 @@ static NSDictionary *NDMergeWapNamed(id extra, NSString *via) {
             m[k] = v;
     }];
     NDNoteWapParam(via.length ? via : @"extraParams",
-                   [NSString stringWithFormat:@"PhoneModel=%@", add[@"PhoneModel"]]);
+                   [NSString stringWithFormat:@"PhoneModel=%@ has_di=%d",
+                    add[@"PhoneModel"],
+                    ([m[@"di"] isKindOfClass:NSString.class] && [((NSString *)m[@"di"]) length]) ? 1 : 0]);
     return m;
 }
 
@@ -1194,6 +1211,73 @@ static NSURLRequest *NDRequestByAddingWapDevice(NSURLRequest *req, NSString *via
     NSMutableURLRequest *m = [req mutableCopy];
     m.URL = nu;
     return m;
+}
+
+static NSURLRequest *NDRequestByAddingWapBody(NSURLRequest *req, NSString *via) {
+    if (![req isKindOfClass:NSURLRequest.class] || !req.URL) return req;
+    NSString *path = (req.URL.path ?: @"").lowercaseString;
+    if (!NDURLIsLoginSubmit(req.URL) && ![path containsString:@"/login/api/auth"]) return req;
+    NSDictionary *add = NDWapDeviceDict();
+    if (!add) return req;
+    NSData *body = req.HTTPBody;
+    if (!body.length || body.length > 1024 * 1024) return req;
+    NSString *ct = nil;
+    for (NSString *k in req.allHTTPHeaderFields) {
+        if ([k caseInsensitiveCompare:@"Content-Type"] == NSOrderedSame) {
+            ct = req.allHTTPHeaderFields[k];
+            break;
+        }
+    }
+    NSString *ctl = (ct ?: @"").lowercaseString;
+    if ([ctl containsString:@"multipart"]) return req;
+    NSString *s = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+    if (!s.length) return req;
+    if ([s containsString:@"PhoneModel="] || [s containsString:@"\"PhoneModel\""]) {
+        BOOL hasDi = [s containsString:@"di="] || [s containsString:@"\"di\""];
+        NDNoteWapParam(via, [NSString stringWithFormat:@"body already has_di=%d %@", hasDi ? 1 : 0, NDShortPassURL(req.URL)]);
+        return req;
+    }
+    if ([s hasPrefix:@"{"] || [ctl containsString:@"json"]) {
+        id obj = nil;
+        @try { obj = [NSJSONSerialization JSONObjectWithData:body options:NSJSONReadingMutableContainers error:nil]; }
+        @catch (__unused NSException *e) { obj = nil; }
+        if (![obj isKindOfClass:NSMutableDictionary.class] && [obj isKindOfClass:NSDictionary.class])
+            obj = [obj mutableCopy];
+        if ([obj isKindOfClass:NSMutableDictionary.class]) {
+            NSMutableDictionary *m = (NSMutableDictionary *)obj;
+            [add enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+                if (![m[k] isKindOfClass:NSString.class] || ![((NSString *)m[k]) length])
+                    m[k] = v;
+            }];
+            NSData *nb = nil;
+            @try { nb = [NSJSONSerialization dataWithJSONObject:m options:0 error:nil]; }
+            @catch (__unused NSException *e) { nb = nil; }
+            if (nb.length) {
+                NSMutableURLRequest *mr = [req mutableCopy];
+                mr.HTTPBody = nb;
+                BOOL hasDi = [m[@"di"] isKindOfClass:NSString.class] && [((NSString *)m[@"di"]) length];
+                NDNoteWapParam(via, [NSString stringWithFormat:@"jsonbody PhoneModel=%@ has_di=%d %@",
+                                     add[@"PhoneModel"], hasDi ? 1 : 0, NDShortPassURL(req.URL)]);
+                return mr;
+            }
+        }
+        return req;
+    }
+    NSMutableArray *parts = [NSMutableArray array];
+    NSCharacterSet *ok = [NSCharacterSet URLQueryAllowedCharacterSet];
+    [add enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
+        NSString *ek = [k stringByAddingPercentEncodingWithAllowedCharacters:ok] ?: k;
+        NSString *ev = [v stringByAddingPercentEncodingWithAllowedCharacters:ok] ?: v;
+        [parts addObject:[NSString stringWithFormat:@"%@=%@", ek, ev]];
+    }];
+    NSString *extra = [parts componentsJoinedByString:@"&"];
+    NSString *ns = [s stringByAppendingFormat:@"%@%@", [s containsString:@"="] ? @"&" : @"", extra];
+    NSMutableURLRequest *mr = [req mutableCopy];
+    mr.HTTPBody = [ns dataUsingEncoding:NSUTF8StringEncoding];
+    BOOL hasDi = [s containsString:@"di="];
+    NDNoteWapParam(via, [NSString stringWithFormat:@"formbody PhoneModel=%@ has_di=%d %@",
+                         add[@"PhoneModel"], hasDi ? 1 : 0, NDShortPassURL(req.URL)]);
+    return mr;
 }
 
 static void NDSyncDVIFToStore(id store, void (^done)(void)) {
@@ -1602,6 +1686,12 @@ static void NDInstallAll(void) {
     NDInstallOne(@"SAPILoginService",
                  NSSelectorFromString(@"baseParamsForSMSLoginWithInterface:"),
                  NO, '@', 1, "@", (IMP)nd_hook_smsBase, &nd_o_smsBase);
+    NDInstallOne(@"SAPIMainManager",
+                 NSSelectorFromString(@"baseParamsForSMSLoginWithInterface:"),
+                 NO, '@', 1, "@", (IMP)nd_hook_smsBaseMain, &nd_o_smsBaseMain);
+    NDInstallOne(@"SAPILoginManager",
+                 NSSelectorFromString(@"baseParamsForSMSLoginWithInterface:"),
+                 NO, '@', 1, "@", (IMP)nd_hook_smsBaseMgr, &nd_o_smsBaseMgr);
 
     // BDPUserAgent 实例方法
     NDInstallOne(@"BDPUserAgent", NSSelectorFromString(@"useagent_getDeviceInfo"), NO, '@', 0, "",
@@ -1896,8 +1986,10 @@ static NSURLRequest *NDURewriteRequest(NSURLRequest *req, NSURLSession *session,
             }
         }
     }
-    if (c.enabled && c.spoofBaiduSDK)
+    if (c.enabled && c.spoofBaiduSDK) {
         out = NDRequestByAddingWapDevice(out, @"http");
+        out = NDRequestByAddingWapBody(out, @"httpBody");
+    }
     return out;
 }
 
@@ -2449,7 +2541,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-12\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-13\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -2543,7 +2635,7 @@ static void NDShowReport(void) {
     [r appendString:@"读法：di_keys 不含 PhoneModel → H5 登录根本不要机型。\n"];
     [r appendString:@"keys 有 PhoneModel 且回包有值，登录设备仍未知 → Passport 不用这份机型。\n"];
 
-    [r appendString:@"\n—— 登录参数（9.21-12）——\n"];
+    [r appendString:@"\n—— 登录参数（9.21-13）——\n"];
     [r appendFormat:@"写入次数：%d\n", g_wapParamN];
     [r appendFormat:@"wkLoad/passLoad：%d  http登录路径：%d  原生短信：%d\n",
         g_wapViaWk, g_wapViaHttp, g_wapViaSms];
@@ -2552,7 +2644,7 @@ static void NDShowReport(void) {
     [r appendFormat:@"最近出口：%@\n", g_wapParamVia ?: @"(还没写到短信/WAP 参数)"];
     [r appendFormat:@"最近内容：%@\n", g_wapParamLast ?: @"-"];
     [r appendFormat:@"最近 Passport URL：%@\n", g_h5LastURL ?: @"(无)"];
-    [r appendString:@"网页短信看 Cookie 是否>0。原生短信看「原生短信」是否>0。\n"];
+    [r appendString:@"看最近内容里的 has_di。登录 POST 有 di 仍未知 → Passport 不认这份机型。\n"];
     [r appendString:@"登录后看「登录设备」最新一条。\n"];
 
     NDReportVC *rc = [[NDReportVC alloc] initWithReport:r];
