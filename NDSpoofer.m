@@ -1,7 +1,12 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-07
+//  版本：9.21-08
+//
+//  9.21-08：定位到 H5 用 -[PASSWebViewController sapi_action_mini_di:] 向原生要 di_keys，
+//  再经 retrieveDeviceInfoForKeys: 回传。网解自检只读记下 keys 与回包里的 PhoneModel /
+//  device_name / SystemVersion，用来钉死「登录设备未知」是缺机型键还是键有值但 Passport 不认。
+//  不注入 JS、不改回包。
 //
 //  9.21-07：网解自检增加 Passport H5 探针（只记 URL / 该 WebView 仓库有没有 DVIF，不改登录、不注入 JS）。
 //  用来判断「未知设备」是 DVIF 没进登录 WebView，还是进了但 Passport 根本不看 Cookie。
@@ -651,6 +656,8 @@ static IMP nd_o_handleLogin = NULL;
 static IMP nd_o_web2Native = NULL;
 static IMP nd_o_loginSuccessful = NULL;
 static IMP nd_o_logoutCurrent = NULL;
+static IMP nd_o_miniDi = NULL;
+static IMP nd_o_cbUserInfo = NULL;
 
 static void NDFloatOnLoginSuccess(void);
 static void NDFloatOnLogout(void);
@@ -744,6 +751,48 @@ static NSOperatingSystemVersion nd_hook_osVer(id self, SEL _cmd) {
 }
 
 // --- SAPIDeviceInfoHelper ---
+static int g_miniDiN = 0;
+static NSString *g_miniDiKeys = nil;
+static NSString *g_retrieveKeys = nil;
+static NSString *g_lastDiPhone = nil;
+static NSString *g_lastDiName = nil;
+static NSString *g_lastDiVer = nil;
+static NSString *g_cbPhone = nil;
+static NSString *g_cbName = nil;
+static NSString *g_cbVer = nil;
+static int g_cbN = 0;
+
+static NSString *NDJoinKeys(id keys) {
+    if ([keys isKindOfClass:NSString.class]) return keys;
+    if (![keys isKindOfClass:NSArray.class]) return @"-";
+    NSMutableArray *a = [NSMutableArray array];
+    for (id k in (NSArray *)keys) {
+        if ([k isKindOfClass:NSString.class]) [a addObject:k];
+        if (a.count >= 24) break;
+    }
+    return a.count ? [a componentsJoinedByString:@","] : @"-";
+}
+
+static void NDNoteDiDict(BOOL fromCb, NSDictionary *d) {
+    if (![d isKindOfClass:NSDictionary.class]) return;
+    id pm = d[@"PhoneModel"] ?: d[@"phoneModel"];
+    id dn = d[@"device_name"] ?: d[@"deviceName"];
+    id sv = d[@"SystemVersion"] ?: d[@"systemVersion"] ?: d[@"osVersion"];
+    NSString *pms = [pm isKindOfClass:NSString.class] && ((NSString *)pm).length ? (NSString *)pm : @"(无)";
+    NSString *dns = [dn isKindOfClass:NSString.class] && ((NSString *)dn).length ? (NSString *)dn : @"(无)";
+    NSString *svs = [sv isKindOfClass:NSString.class] && ((NSString *)sv).length ? (NSString *)sv : @"(无)";
+    if (fromCb) {
+        g_cbN++;
+        g_cbPhone = [pms copy];
+        g_cbName = [dns copy];
+        g_cbVer = [svs copy];
+    } else {
+        g_lastDiPhone = [pms copy];
+        g_lastDiName = [dns copy];
+        g_lastDiVer = [svs copy];
+    }
+}
+
 static NSString *nd_hook_sapiDeviceModel(id self, SEL _cmd) {
     NDConfig *c = NDCurrentConfig();
     if (c.enabled && c.spoofBaiduSDK && c.hwMachine.length) return c.hwMachine;
@@ -770,10 +819,13 @@ static id nd_hook_sapiPlain(id self, SEL _cmd, id interface) {
 static id nd_hook_sapiRetrieve(id self, SEL _cmd, id keys) {
     id orig = nd_o_sapiRetrieve ? ((id (*)(id, SEL, id))nd_o_sapiRetrieve)(self, _cmd, keys) : nil;
     NDConfig *c = NDCurrentConfig();
+    g_retrieveKeys = [NDJoinKeys(keys) copy];
+    id out = orig;
     if (c.enabled && c.spoofBaiduSDK && [orig isKindOfClass:NSDictionary.class]) {
-        return NDRewriteDict(orig, c, YES);
+        out = NDRewriteDict(orig, c, YES);
     }
-    return orig;
+    if ([out isKindOfClass:NSDictionary.class]) NDNoteDiDict(NO, out);
+    return out;
 }
 static id nd_hook_sapiGenerate(id self, SEL _cmd, id plain) {
     NDConfig *c = NDCurrentConfig();
@@ -810,6 +862,41 @@ static BOOL nd_hook_logoutCurrent(id self, SEL _cmd) {
     BOOL r = nd_o_logoutCurrent ? ((BOOL (*)(id, SEL))nd_o_logoutCurrent)(self, _cmd) : NO;
     NDFloatOnLogout();
     return r;
+}
+
+static void nd_hook_miniDi(id self, SEL _cmd, id cmd) {
+    g_miniDiN++;
+    @try {
+        id params = nil;
+        SEL psel = NSSelectorFromString(@"paramsInfo");
+        if (cmd && [cmd respondsToSelector:psel])
+            params = ((id (*)(id, SEL))objc_msgSend)(cmd, psel);
+        id keys = nil;
+        SEL akey = NSSelectorFromString(@"sapi_arrayForKey:");
+        if (params && [params respondsToSelector:akey])
+            keys = ((id (*)(id, SEL, id))objc_msgSend)(params, akey, @"di_keys");
+        if (!keys && [params isKindOfClass:NSDictionary.class])
+            keys = ((NSDictionary *)params)[@"di_keys"];
+        if (!keys && [cmd isKindOfClass:NSDictionary.class])
+            keys = ((NSDictionary *)cmd)[@"di_keys"];
+        g_miniDiKeys = [NDJoinKeys(keys) copy];
+    } @catch (__unused NSException *e) {}
+    if (nd_o_miniDi)
+        ((void (*)(id, SEL, id))nd_o_miniDi)(self, _cmd, cmd);
+}
+
+static void nd_hook_cbUserInfo(id self, SEL _cmd, id command, id info) {
+    @try {
+        if ([info isKindOfClass:NSDictionary.class]) {
+            NSDictionary *d = (NSDictionary *)info;
+            if (d[@"PhoneModel"] || d[@"phoneModel"] || d[@"device_name"] ||
+                d[@"deviceName"] || d[@"SystemVersion"] || d[@"systemVersion"]) {
+                NDNoteDiDict(YES, d);
+            }
+        }
+    } @catch (__unused NSException *e) {}
+    if (nd_o_cbUserInfo)
+        ((void (*)(id, SEL, id, id))nd_o_cbUserInfo)(self, _cmd, command, info);
 }
 
 static int g_ndInSetCookie = 0;
@@ -1222,6 +1309,10 @@ static void NDInstallAll(void) {
                  'v', 0, "", (IMP)nd_hook_loginSuccessful, &nd_o_loginSuccessful);
     NDInstallOne(@"SAPILoginService", NSSelectorFromString(@"logoutCurrentModel"), NO,
                  'B', 0, "", (IMP)nd_hook_logoutCurrent, &nd_o_logoutCurrent);
+    NDInstallOne(@"PASSWebViewController", NSSelectorFromString(@"sapi_action_mini_di:"), NO,
+                 'v', 1, "@", (IMP)nd_hook_miniDi, &nd_o_miniDi);
+    NDInstallOne(@"SAPIWebView", NSSelectorFromString(@"callBackSuccessWithCommand:userInfo:"), NO,
+                 'v', 2, "@@", (IMP)nd_hook_cbUserInfo, &nd_o_cbUserInfo);
 
     // BDPUserAgent 实例方法
     NDInstallOne(@"BDPUserAgent", NSSelectorFromString(@"useagent_getDeviceInfo"), NO, '@', 0, "",
@@ -2053,7 +2144,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-07\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-08\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -2132,6 +2223,20 @@ static void NDShowReport(void) {
     [r appendString:@"读法：仓库「有」但登录设备仍未知 → Passport 登录不看 DVIF。\n"];
     [r appendString:@"仓库「无」→ DVIF 没进登录 WebView。\n"];
     [r appendString:@"Cookie 头经常是 0（WK 把 Cookie 放仓库不放头），以仓库为准。\n"];
+
+    [r appendString:@"\n—— H5 mini_di 桥（9.21-08，只读）——\n"];
+    [r appendFormat:@"sapi_action_mini_di 次数：%d\n", g_miniDiN];
+    [r appendFormat:@"H5 要的 di_keys：%@\n", g_miniDiKeys ?: @"(还没调到 mini_di)"];
+    [r appendFormat:@"retrieve 最近 keys：%@\n", g_retrieveKeys ?: @"(无)"];
+    [r appendFormat:@"retrieve 回包 PhoneModel：%@\n", g_lastDiPhone ?: @"(无)"];
+    [r appendFormat:@"retrieve 回包 device_name：%@\n", g_lastDiName ?: @"(无)"];
+    [r appendFormat:@"retrieve 回包 SystemVersion：%@\n", g_lastDiVer ?: @"(无)"];
+    [r appendFormat:@"回给 H5 次数：%d\n", g_cbN];
+    [r appendFormat:@"回给 H5 PhoneModel：%@\n", g_cbPhone ?: @"(无)"];
+    [r appendFormat:@"回给 H5 device_name：%@\n", g_cbName ?: @"(无)"];
+    [r appendFormat:@"回给 H5 SystemVersion：%@\n", g_cbVer ?: @"(无)"];
+    [r appendString:@"读法：di_keys 不含 PhoneModel → H5 登录根本不要机型。\n"];
+    [r appendString:@"keys 有 PhoneModel 且回包有值，登录设备仍未知 → Passport 不用这份机型。\n"];
 
     NDReportVC *rc = [[NDReportVC alloc] initWithReport:r];
     UIViewController *host = NDFloatHostVC();
