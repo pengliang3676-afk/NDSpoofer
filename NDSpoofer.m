@@ -1463,7 +1463,7 @@ static NSString *NDShortUA(NSString *ua) {
         [closeX.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
         [closeX.widthAnchor constraintEqualToConstant:30],
 
-        [_textView.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:10],
+        [_textView.topAnchor constraintEqualToAnchor:titleLbl.bottomAnchor constant:10],
         [_textView.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
         [_textView.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
         [_textView.bottomAnchor constraintEqualToAnchor:_copyBtn.topAnchor constant:-12],
