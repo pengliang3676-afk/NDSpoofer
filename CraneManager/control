@@ -1,6 +1,6 @@
 Package: com.peng.ndspoofer.cranemanager
 Name: 网解
-Version: 9.21-18
+Version: 9.21-19
 Architecture: iphoneos-arm64e
 Description: 为百度网盘的 Crane 容器逐容器生成并写入 NDSpoofer 设备指纹配置。
 Maintainer: peng

@@ -1,7 +1,11 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-18
+//  版本：9.21-19
+//
+//  9.21-19：登录设备未知已确认与网解无关。修 NAD UA 旧缓存不改写（启动读盘再写），
+//  以及 sofire hwphysm 在 2GB+ 用 int32 溢出（4GB 报成 1.84e19）。系统池不封顶。
+//  管理器 deb 与 dylib 同版本。不注入 JS。
 //
 //  9.21-18：同一笔登录记录是 iPhone (iOS18.1.1)，登录设备仍未知。记录看 UA，
 //  设备看 di。源头 hook freeDiskSize（[22] 仍是真机约 34GB 空闲）和
@@ -538,11 +542,14 @@ static void NDNoteSapiPlainFields(NSString *s) {
 // 即使 NSProcessInfo hook 已改源头，仍可能在 hook 安装前构造、或走内部缓存，故在 setObject 出口兜底。
 // 仅按白名单 key 处理，其余一律原样透传。
 
-// 按原始 NSNumber 的整型类型写入伪装内存字节数，保持与 App 自身编码一致（sofire 为 int32 截断）。
+// 按伪装内存字节数写入 NSNumber。2GB 及以上无法放进有符号 int32（真机 3GB 截断会变成
+// 1.84e19 那种垃圾），一律升格为 64 位，避免 sofire hwphysm 溢出。
 static NSNumber *NDFakeMemNumber(NSNumber *orig, uint64_t fakeBytes) {
+    if (!orig || fakeBytes > (uint64_t)INT32_MAX)
+        return [NSNumber numberWithUnsignedLongLong:fakeBytes];
     const char *t = orig.objCType ?: "";
     switch (t[0]) {
-        case 'i': return [NSNumber numberWithInt:(int32_t)(uint32_t)fakeBytes];
+        case 'i': return [NSNumber numberWithInt:(int32_t)fakeBytes];
         case 'I': return [NSNumber numberWithUnsignedInt:(uint32_t)fakeBytes];
         case 'l': return [NSNumber numberWithLong:(long)fakeBytes];
         case 'L': return [NSNumber numberWithUnsignedLong:(unsigned long)fakeBytes];
@@ -550,7 +557,7 @@ static NSNumber *NDFakeMemNumber(NSNumber *orig, uint64_t fakeBytes) {
         case 'Q': return [NSNumber numberWithUnsignedLongLong:fakeBytes];
         case 's': return [NSNumber numberWithShort:(int16_t)(uint16_t)fakeBytes];
         case 'S': return [NSNumber numberWithUnsignedShort:(uint16_t)fakeBytes];
-        default:  return [NSNumber numberWithLongLong:(int64_t)fakeBytes];
+        default:  return [NSNumber numberWithUnsignedLongLong:fakeBytes];
     }
 }
 
@@ -576,7 +583,7 @@ static NSDictionary *NDRewriteSplashDict(NSDictionary *d, NDConfig *c) {
     return m;
 }
 
-// dvlwfrqupdt（sofire）：hwphysm 为 NSNumber（int32 截断），dsks 为 NSString 磁盘字节（仅档位不同才改）。
+// dvlwfrqupdt（sofire）：hwphysm 为 NSNumber。2GB+ 不再跟 int32 截断，改写为 64 位。
 static NSDictionary *NDRewriteSofireDict(NSDictionary *d, NDConfig *c) {
     NSMutableDictionary *m = d.mutableCopy;
     if (c.memorySizeMB > 0) {
@@ -639,8 +646,28 @@ static id NDRewriteDefaultsValue(NSString *key, id value, NDConfig *c) {
                                        @"NADCustomUserAgentKey", @"NADUserAgentKey"]];
     });
     if ([uaKeys containsObject:key] && [value isKindOfClass:NSString.class])
-        return NDRewriteCachedUA(value, c, NO);
+        return NDRewriteUA(value, c);
     return value;
+}
+
+// 启动时把已经落盘的 NAD UA / sofire 再写一遍。只 hook setObject 会漏过冷启动前的旧缓存。
+static void NDRewritePersistedDefaults(void) {
+    NDConfig *c = NDCurrentConfig();
+    if (!c || !c.enabled || !c.spoofBaiduSDK) return;
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    NSArray<NSString *> *keys = @[
+        @"NADSplashLatestLogFormationKeyName", @"dvlwfrqupdt",
+        @"BBAUserAgentCheckInfoKey", @"BBAUserAgentKey", @"GDTDefaultUA",
+        @"NADCustomUserAgentKey", @"NADUserAgentKey"
+    ];
+    for (NSString *k in keys) {
+        id v = [d objectForKey:k];
+        if (!v) continue;
+        id nv = NDRewriteDefaultsValue(k, v, c);
+        if (!nv || nv == v) continue;
+        if ([nv isEqual:v]) continue;
+        [d setObject:nv forKey:k];
+    }
 }
 
 // 字典白名单键：只改机型/系统版本承载键
@@ -2221,6 +2248,7 @@ static void NDEarlyInstallDefaults(void) {
 static void NDEarlyInstall(void) {
     NDInstallAll();
     NDEarlyInstallDefaults();
+    NDRewritePersistedDefaults();
 }
 
 static void NDStartObjCHooks(void) {
@@ -2573,7 +2601,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-18\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-19\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -2679,7 +2707,7 @@ static void NDShowReport(void) {
     [r appendString:@"看最近内容里的 has_di。登录 POST 有 di 仍未知 → 看下面明文字段是否自洽。\n"];
     [r appendString:@"登录后看「登录设备」最新一条。\n"];
 
-    [r appendString:@"\n—— 加密前 di 明文（9.21-18）——\n"];
+    [r appendString:@"\n—— 加密前 di 明文（9.21-19）——\n"];
     [r appendFormat:@"采样：%d  其中有SOH：%d  字段数：%d\n", g_plainN, g_plainSohN, g_plainCnt];
     [r appendFormat:@"[3] PhoneModel：%@\n", g_plainPM ?: @"(无)"];
     [r appendFormat:@"[4] SystemVersion：%@\n", g_plainVer ?: @"(无)"];
@@ -2804,6 +2832,7 @@ static void nd_constructor(void) {
                                                           object:nil queue:NSOperationQueue.mainQueue
                                                       usingBlock:^(__unused NSNotification *note) {
             NDLoadConfig();
+            NDRewritePersistedDefaults();
             NDEnsureFloatWindow();
         }];
         NSLog(@"[NDSpoofer] loaded profile=%@ (%@) iOS %@",
