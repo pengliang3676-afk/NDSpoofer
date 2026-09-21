@@ -1411,12 +1411,12 @@ static NSString *NDShortUA(NSString *ua) {
     card.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:card];
 
-    UILabel *title = [UILabel new];
-    title.text = @"网解 · 自检报告";
-    title.textColor = UIColor.whiteColor;
-    title.font = [UIFont boldSystemFontOfSize:16];
-    title.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:title];
+    UILabel *titleLbl = [UILabel new];
+    titleLbl.text = @"网解 · 自检报告";
+    titleLbl.textColor = UIColor.whiteColor;
+    titleLbl.font = [UIFont boldSystemFontOfSize:16];
+    titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:titleLbl];
 
     UIButton *closeX = [UIButton buttonWithType:UIButtonTypeSystem];
     [closeX setTitle:@"✕" forState:UIControlStateNormal];
@@ -1456,10 +1456,10 @@ static NSString *NDShortUA(NSString *ua) {
         [card.widthAnchor constraintEqualToAnchor:safe.widthAnchor multiplier:0.92],
         [card.heightAnchor constraintEqualToAnchor:safe.heightAnchor multiplier:0.80],
 
-        [title.topAnchor constraintEqualToAnchor:card.topAnchor constant:14],
-        [title.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [titleLbl.topAnchor constraintEqualToAnchor:card.topAnchor constant:14],
+        [titleLbl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
 
-        [closeX.centerYAnchor constraintEqualToAnchor:title.centerYAnchor],
+        [closeX.centerYAnchor constraintEqualToAnchor:titleLbl.centerYAnchor],
         [closeX.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
         [closeX.widthAnchor constraintEqualToConstant:30],
 
