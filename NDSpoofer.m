@@ -1,7 +1,11 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-09
+//  版本：9.21-10
+//
+//  9.21-10：09 写入次数=0。原因是 WKWebView loadRequest 在 Cookie 已有 DVIF 时直接原样放过，
+//  PhoneModel 没写进地址。改为无论有没有 DVIF 都写查询串；同一套字段再补到 NSURLSession
+//  和 -[SAPILoginManager addBaseParamsWith:interface:]。不注入 JS。
 //
 //  9.21-09：H5 登录不调 mini_di。改为在原生打开 WAP 登录页时把 PhoneModel / device_name /
 //  SystemVersion 写进 URL 查询串和 extraParams（PASSWebView loadRequest、loadLogin extraParams、
@@ -667,8 +671,11 @@ static IMP nd_o_allExtraQP = NULL;
 static IMP nd_o_loadLoginType = NULL;
 static IMP nd_o_loadLoginCfg = NULL;
 static IMP nd_o_addBaseQS = NULL;
+static IMP nd_o_addBaseParams = NULL;
 
 static NSDictionary *NDMergeWapDict(id extra);
+static NSDictionary *NDWapDeviceDict(void);
+static void NDNoteWapParam(NSString *via, NSString *detail);
 
 static void NDFloatOnLoginSuccess(void);
 static void NDFloatOnLogout(void);
@@ -934,6 +941,25 @@ static id nd_hook_addBaseQS(id self, SEL _cmd, id url, id other) {
         merged = NDMergeWapDict(other);
     return nd_o_addBaseQS ? ((id (*)(id, SEL, id, id))nd_o_addBaseQS)(self, _cmd, url, merged) : url;
 }
+static void nd_hook_addBaseParams(id self, SEL _cmd, id params, id iface) {
+    NSDictionary *add = NDWapDeviceDict();
+    if (add) {
+        if ([params isKindOfClass:NSMutableDictionary.class]) {
+            NSMutableDictionary *m = (NSMutableDictionary *)params;
+            [add enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+                if (![m[k] isKindOfClass:NSString.class] || ![((NSString *)m[k]) length])
+                    m[k] = v;
+            }];
+            NDNoteWapParam(@"addBaseParams",
+                           [NSString stringWithFormat:@"iface=%@ PhoneModel=%@",
+                            [iface isKindOfClass:NSString.class] ? iface : @"-", add[@"PhoneModel"]]);
+        } else if ([params isKindOfClass:NSDictionary.class] || params == nil) {
+            params = NDMergeWapDict(params);
+        }
+    }
+    if (nd_o_addBaseParams)
+        ((void (*)(id, SEL, id, id))nd_o_addBaseParams)(self, _cmd, params, iface);
+}
 
 static int g_ndInSetCookie = 0;
 
@@ -1009,7 +1035,9 @@ static NSDictionary *NDMergeWapDict(id extra) {
 static NSURL *NDURLByAddingWapDevice(NSURL *u, NSString *via) {
     if (![u isKindOfClass:NSURL.class] || !u.host.length) return u;
     NSString *h = u.host.lowercaseString;
-    if (![h containsString:@"wappass"] && ![h containsString:@"passport"]) return u;
+    BOOL wap = [h containsString:@"wappass"] || [h containsString:@"passport"] ||
+               [h isEqualToString:@"pass.baidu.com"] || [h hasSuffix:@".pass.baidu.com"];
+    if (!wap) return u;
     NSDictionary *add = NDWapDeviceDict();
     if (!add) return u;
     NSString *abs = u.absoluteString ?: @"";
@@ -1429,6 +1457,8 @@ static void NDInstallAll(void) {
                  'v', 2, "@@", (IMP)nd_hook_loadLoginCfg, &nd_o_loadLoginCfg);
     NDInstallOne(@"SAPIURLHelper", NSSelectorFromString(@"addBaseQueryToURLString:otherQuery:"), YES,
                  '@', 2, "@@", (IMP)nd_hook_addBaseQS, &nd_o_addBaseQS);
+    NDInstallOne(@"SAPILoginManager", NSSelectorFromString(@"addBaseParamsWith:interface:"), NO,
+                 'v', 2, "@@", (IMP)nd_hook_addBaseParams, &nd_o_addBaseParams);
 
     // BDPUserAgent 实例方法
     NDInstallOne(@"BDPUserAgent", NSSelectorFromString(@"useagent_getDeviceInfo"), NO, '@', 0, "",
@@ -1567,9 +1597,11 @@ static void ndu_tr_wkSetUA(id self, SEL _cmd, id ua) {
 static id ndu_tr_wkLoad(id self, SEL _cmd, id req) {
     NSURLRequest *r = [req isKindOfClass:NSURLRequest.class] ? (NSURLRequest *)req : nil;
     NDConfig *c = NDCurrentConfig();
+    if (r && c && c.enabled && c.spoofBaiduSDK)
+        r = NDRequestByAddingWapDevice(r, @"wkLoad");
     if (!r || !c || !c.enabled || !c.spoofBaiduSDK || !NDURLNeedsDVIF(r.URL) || NDRequestHasDVIF(r)) {
         NDNotePassReq(@"load", r);
-        return ((id(*)(id, SEL, id))objc_msgSend)(self, g_nduSelWkLoad, req);
+        return ((id(*)(id, SEL, id))objc_msgSend)(self, g_nduSelWkLoad, r ?: req);
     }
     NDEnsureDeviceCookie();
     __block BOOL went = NO;
@@ -1640,6 +1672,7 @@ static BOOL ndu_tr_passShould(id self, SEL _cmd, id req, long long navType) {
 static void ndu_tr_sapiLoadCk(id self, SEL _cmd, id url, id cookies) {
     NDConfig *c = NDCurrentConfig();
     id outCk = cookies;
+    id outUrl = url;
     if (c && c.enabled && c.spoofBaiduSDK) {
         NDEnsureDeviceCookie();
         NSArray *dv = NDDVIFCookiesFromShared();
@@ -1649,8 +1682,15 @@ static void ndu_tr_sapiLoadCk(id self, SEL _cmd, id url, id cookies) {
             [m addObjectsFromArray:dv];
             outCk = m;
         }
+        if ([url isKindOfClass:NSURL.class]) {
+            outUrl = NDURLByAddingWapDevice((NSURL *)url, @"sapiLoad");
+        } else if ([url isKindOfClass:NSString.class]) {
+            NSURL *u = [NSURL URLWithString:(NSString *)url];
+            NSURL *nu = NDURLByAddingWapDevice(u, @"sapiLoad");
+            if (nu) outUrl = nu.absoluteString ?: url;
+        }
     }
-    ((void(*)(id, SEL, id, id))objc_msgSend)(self, g_nduSelSapiLoadCk, url, outCk);
+    ((void(*)(id, SEL, id, id))objc_msgSend)(self, g_nduSelSapiLoadCk, outUrl, outCk);
 }
 
 // 2) -[BDPUserAgent webViewDefaultUserAgent]：裸 Mozilla 前缀源头
@@ -1678,38 +1718,44 @@ static void ndu_tr_setHdr(id self, SEL _cmd, id value, id field) {
 // 4) NSURLSession dataTask 出口：复制请求并改写 UA 头（覆盖 native 登录链）
 static NSURLRequest *NDURewriteRequest(NSURLRequest *req, NSURLSession *session, NDConfig *c) {
     NDNotePassReq(@"http", req);
-    if (g_nduInRewrite || !c.enabled || !c.spoofUA || ![req isKindOfClass:NSURLRequest.class])
-        return req;
-    __block NSString *ua = nil;
-    [req.allHTTPHeaderFields enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
-        if ([key isKindOfClass:NSString.class] &&
-            [(NSString *)key caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame &&
-            [obj isKindOfClass:NSString.class]) {
-            ua = obj;
-            *stop = YES;
+    if (![req isKindOfClass:NSURLRequest.class]) return req;
+    NSURLRequest *out = req;
+    if (g_nduInRewrite == 0 && c.enabled && c.spoofUA) {
+        __block NSString *ua = nil;
+        [req.allHTTPHeaderFields enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
+            if ([key isKindOfClass:NSString.class] &&
+                [(NSString *)key caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame &&
+                [obj isKindOfClass:NSString.class]) {
+                ua = obj;
+                *stop = YES;
+            }
+        }];
+        if (![ua isKindOfClass:NSString.class] && session) {
+            @try {
+                id sh = session.configuration.HTTPAdditionalHeaders[@"User-Agent"];
+                if ([sh isKindOfClass:NSString.class]) ua = sh;
+            } @catch (__unused NSException *e) {}
         }
-    }];
-    // 请求头没有时，再看 session 配置级 UA（HTTPAdditionalHeaders）
-    if (![ua isKindOfClass:NSString.class] && session) {
-        @try {
-            id sh = session.configuration.HTTPAdditionalHeaders[@"User-Agent"];
-            if ([sh isKindOfClass:NSString.class]) ua = sh;
-        } @catch (__unused NSException *e) {}
+        if ([ua isKindOfClass:NSString.class] && NDUAContainsReal(ua, c)) {
+            NSString *newUA = NDRewriteUA(ua, c);
+            if (![newUA isEqualToString:ua]) {
+                NSMutableURLRequest *m = nil;
+                g_nduInRewrite++;
+                @try {
+                    m = [req mutableCopy];
+                    [m setValue:newUA forHTTPHeaderField:@"User-Agent"];
+                } @catch (__unused NSException *e) {
+                    m = nil;
+                } @finally {
+                    g_nduInRewrite--;
+                }
+                if (m) out = m;
+            }
+        }
     }
-    if (![ua isKindOfClass:NSString.class] || !NDUAContainsReal(ua, c)) return req;
-    NSString *newUA = NDRewriteUA(ua, c);
-    if ([newUA isEqualToString:ua]) return req;
-    NSMutableURLRequest *m = nil;
-    g_nduInRewrite++;
-    @try {
-        m = [req mutableCopy];
-        [m setValue:newUA forHTTPHeaderField:@"User-Agent"];
-    } @catch (__unused NSException *e) {
-        m = nil;
-    } @finally {
-        g_nduInRewrite--;
-    }
-    return m ?: req;
+    if (c.enabled && c.spoofBaiduSDK)
+        out = NDRequestByAddingWapDevice(out, @"http");
+    return out;
 }
 
 static id ndu_tr_dt1(id self, SEL _cmd, NSURLRequest *req) {
@@ -2260,7 +2306,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-09\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-10\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -2354,11 +2400,13 @@ static void NDShowReport(void) {
     [r appendString:@"读法：di_keys 不含 PhoneModel → H5 登录根本不要机型。\n"];
     [r appendString:@"keys 有 PhoneModel 且回包有值，登录设备仍未知 → Passport 不用这份机型。\n"];
 
-    [r appendString:@"\n—— WAP 登录参数（9.21-09）——\n"];
+    [r appendString:@"\n—— WAP 登录参数（9.21-10）——\n"];
     [r appendFormat:@"写入次数：%d\n", g_wapParamN];
     [r appendFormat:@"最近出口：%@\n", g_wapParamVia ?: @"(还没写到登录 URL)"];
     [r appendFormat:@"最近内容：%@\n", g_wapParamLast ?: @"-"];
-    [r appendString:@"登录后看「登录设备」最新一条。仍未知就换下一刀原生出口。\n"];
+    [r appendFormat:@"最近 Passport URL：%@\n", g_h5LastURL ?: @"(无)"];
+    [r appendString:@"09 写入=0 是因为 Cookie 已有 DVIF 时 loadRequest 被跳过。10 不再跳过。\n"];
+    [r appendString:@"登录后看「登录设备」最新一条。仍未知再说。\n"];
 
     NDReportVC *rc = [[NDReportVC alloc] initWithReport:r];
     UIViewController *host = NDFloatHostVC();
