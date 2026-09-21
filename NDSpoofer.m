@@ -1,7 +1,10 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-16
+//  版本：9.21-17
+//
+//  9.21-17：16 在自洽 iPhone10,3 上 [14]=false，不是 CPU。15 曾把 CPU 字符串写进
+//  这个格子。停改 [14]。报告打出全部 SOH 字段，对照 SE2 泄漏。不注入 JS。
 //
 //  9.21-16：15 新容器实测 [20]=6291456（6GB ram）、[21]=62467188（真机约 64GB 盘），
 //  [11]/[12] 不是 is_root/emulator。mapper 旁的 cuid 字符串不能当 SOH 下标。
@@ -474,9 +477,8 @@ static NSString *NDRewriteDeviceInfoLine(NSString *s, NDConfig *c) {
     return [NSString stringWithFormat:@"%@_%@", head, c.systemVersion];
 }
 
-// SAPI 明文设备串以 \x01（SOH）分隔。15 新容器实测：[3] PhoneModel [4] SystemVersion
-// [20] 为 ram(KB)（已随 NSProcessInfo 变成配置内存）[21] 为 disk(KB)（15 停写后漏出真机约 64GB）。
-// [11]/[12] 不是 is_root/emulator，不能按 mapper 旁的 cuid 字符串当下来改。
+// SAPI 明文设备串以 \x01（SOH）分隔。运行时：[3] PhoneModel [4] SystemVersion
+// [20] ram(KB) [21] disk(KB)。[14] 实测是 false，不是 CPU，16 起不再改。
 static NSString *NDRewriteSapiPlain(NSString *s, NDConfig *c) {
     if (![s isKindOfClass:NSString.class] || !s.length) return s;
     NSString *sep = @"\x01";
@@ -492,10 +494,6 @@ static NSString *NDRewriteSapiPlain(NSString *s, NDConfig *c) {
         if ([verRx firstMatchInString:f[4] options:0 range:NSMakeRange(0, f[4].length)])
             f[4] = c.systemVersion;
     }
-    if (c.cpuBrand.length && f.count > 14 && f[14].length &&
-        ([f[14] containsString:@"Apple"] || [f[14] containsString:@"A1"]) &&
-        ![f[14] containsString:c.cpuBrand])
-        f[14] = c.cpuBrand;
     if (c.memorySizeMB > 0 && f[20].length &&
         [f[20] rangeOfString:@"^\\d+$" options:NSRegularExpressionSearch].location != NSNotFound)
         f[20] = [NSString stringWithFormat:@"%ld", (long)c.memorySizeMB * 1024L];
@@ -509,8 +507,9 @@ static NSString *NDRewriteSapiPlain(NSString *s, NDConfig *c) {
 }
 
 static int g_plainN = 0, g_plainCnt = 0, g_plainSohN = 0;
-static NSString *g_plainPM = nil, *g_plainVer = nil, *g_plainCpu = nil;
-static NSString *g_plainRam = nil, *g_plainDsk = nil, *g_plainF11 = nil, *g_plainF12 = nil;
+static NSString *g_plainPM = nil, *g_plainVer = nil;
+static NSString *g_plainRam = nil, *g_plainDsk = nil;
+static NSArray<NSString *> *g_plainAll = nil;
 
 static void NDNoteSapiPlainFields(NSString *s) {
     g_plainN++;
@@ -520,11 +519,9 @@ static void NDNoteSapiPlainFields(NSString *s) {
     NSArray *f = [s componentsSeparatedByString:sep];
     g_plainSohN++;
     g_plainCnt = (int)f.count;
+    g_plainAll = [f copy];
     g_plainPM = f.count > 3 ? [f[3] copy] : nil;
     g_plainVer = f.count > 4 ? [f[4] copy] : nil;
-    g_plainF11 = f.count > 11 ? [f[11] copy] : nil;
-    g_plainF12 = f.count > 12 ? [f[12] copy] : nil;
-    g_plainCpu = f.count > 14 ? [f[14] copy] : nil;
     g_plainRam = f.count > 20 ? [f[20] copy] : nil;
     g_plainDsk = f.count > 21 ? [f[21] copy] : nil;
 }
@@ -2516,7 +2513,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-16\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-17\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -2622,17 +2619,27 @@ static void NDShowReport(void) {
     [r appendString:@"看最近内容里的 has_di。登录 POST 有 di 仍未知 → 看下面明文字段是否自洽。\n"];
     [r appendString:@"登录后看「登录设备」最新一条。\n"];
 
-    [r appendString:@"\n—— 加密前 di 明文（9.21-16）——\n"];
+    [r appendString:@"\n—— 加密前 di 明文（9.21-17）——\n"];
     [r appendFormat:@"采样：%d  其中有SOH：%d  字段数：%d\n", g_plainN, g_plainSohN, g_plainCnt];
     [r appendFormat:@"[3] PhoneModel：%@\n", g_plainPM ?: @"(无)"];
     [r appendFormat:@"[4] SystemVersion：%@\n", g_plainVer ?: @"(无)"];
-    [r appendFormat:@"[14] cpu：%@\n", g_plainCpu ?: @"(无)"];
     [r appendFormat:@"[20] ram(KB)：%@\n", g_plainRam ?: @"(无)"];
     [r appendFormat:@"[21] disk(KB)：%@\n", g_plainDsk ?: @"(无)"];
-    [r appendFormat:@"[11]/[12]：%@ / %@\n", g_plainF11 ?: @"-", g_plainF12 ?: @"-"];
     [r appendFormat:@"配置内存：%ldMB  磁盘：%ldGB  CPU：%@\n",
         (long)c.memorySizeMB, (long)c.diskSizeGB, c.cpuBrand ?: @"-"];
-    [r appendString:@"[20] 应对齐内存×1024，[21] 对齐磁盘×1024×1024。\n"];
+    [r appendString:@"[14] 实测是 false，不再当 CPU 改。下面是全部字段。\n"];
+    if (g_plainAll.count) {
+        NSUInteger n = MIN((NSUInteger)g_plainAll.count, (NSUInteger)48);
+        for (NSUInteger i = 0; i < n; i++) {
+            NSString *v = g_plainAll[i];
+            if (![v isKindOfClass:NSString.class] || !v.length) v = @"(空)";
+            else if (v.length > 42)
+                v = [[v substringToIndex:42] stringByAppendingString:@"…"];
+            [r appendFormat:@"[%lu] %@\n", (unsigned long)i, v];
+        }
+    } else {
+        [r appendString:@"（还没有 SOH 样本）\n"];
+    }
 
     NDReportVC *rc = [[NDReportVC alloc] initWithReport:r];
     UIViewController *host = NDFloatHostVC();
