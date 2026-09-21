@@ -1,7 +1,10 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-01
+//  版本：9.21-02
+//
+//  9.21-02：悬浮球不再直接弹系统分享，改为在屏幕内弹出可滚动的自检报告卡片
+//  （可直接查看 / 复制 / 转发，点遮罩或关闭按钮收起）；管理器与悬浮球名称统一改为“网解”。
 //
 //  9.21-01 新增（13.33.6 解密二进制反汇编证据：Passport 登录层不读屏幕，屏幕只进百度移动统计
 //  EBAppLogDeviceHelper 的 +resolution / +resolutionString / +screenScale；而 UIScreen.bounds 被
@@ -38,7 +41,7 @@
 //   4. 不碰 App 版本、Sapi SDK 版本、tpl、cuid/utdid/deviceID、TeamID、运营商（默认）。
 //   5. 任何开关关闭或配置缺失一律透传原实现；hook 安装前做类型编码校验，不匹配就不装。
 //
-//  配置文件：容器 Documents/ndspoofer_config.plist（由“网盘解”管理器逐容器写入）。
+//  配置文件：容器 Documents/ndspoofer_config.plist（由“网解”管理器逐容器写入）。
 //
 
 #import <Foundation/Foundation.h>
@@ -1356,10 +1359,167 @@ static NSString *NDShortUA(NSString *ua) {
     return ua.length > 48 ? [[ua substringToIndex:48] stringByAppendingString:@"…"] : ua;
 }
 
+// ============================== 自检报告卡片（屏幕内可滚动查看 / 复制 / 转发） ==============================
+@interface NDReportVC : UIViewController <UIGestureRecognizerDelegate>
+@property(nonatomic, copy) NSString *report;
+- (instancetype)initWithReport:(NSString *)report;
+- (void)ndCopy;
+- (void)ndShare;
+- (void)ndClose;
+@end
+
+@implementation NDReportVC {
+    UITextView *_textView;
+    UIButton *_copyBtn;
+}
+
+- (instancetype)initWithReport:(NSString *)report {
+    self = [super initWithNibName:nil bundle:nil];
+    if (self) {
+        _report = [report copy];
+        self.modalPresentationStyle = UIModalPresentationOverFullScreen;
+        self.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
+    }
+    return self;
+}
+
+- (UIButton *)ndButtonWithTitle:(NSString *)title action:(SEL)action {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    [b setTitle:title forState:UIControlStateNormal];
+    [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    b.layer.cornerRadius = 10;
+    b.layer.masksToBounds = YES;
+    b.translatesAutoresizingMaskIntoConstraints = NO;
+    [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
+
+    UITapGestureRecognizer *bgTap = [[UITapGestureRecognizer alloc] initWithTarget:self
+                                                                            action:@selector(ndClose)];
+    bgTap.delegate = self;
+    [self.view addGestureRecognizer:bgTap];
+
+    UIView *card = [UIView new];
+    card.backgroundColor = [UIColor colorWithRed:0.12 green:0.13 blue:0.15 alpha:1.0];
+    card.layer.cornerRadius = 16;
+    card.layer.masksToBounds = YES;
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:card];
+
+    UILabel *title = [UILabel new];
+    title.text = @"网解 · 自检报告";
+    title.textColor = UIColor.whiteColor;
+    title.font = [UIFont boldSystemFontOfSize:16];
+    title.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:title];
+
+    UIButton *closeX = [UIButton buttonWithType:UIButtonTypeSystem];
+    [closeX setTitle:@"✕" forState:UIControlStateNormal];
+    [closeX setTitleColor:UIColor.lightGrayColor forState:UIControlStateNormal];
+    closeX.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+    closeX.translatesAutoresizingMaskIntoConstraints = NO;
+    [closeX addTarget:self action:@selector(ndClose) forControlEvents:UIControlEventTouchUpInside];
+    [card addSubview:closeX];
+
+    _textView = [[UITextView alloc] init];
+    _textView.text = self.report;
+    _textView.editable = NO;
+    _textView.selectable = YES;
+    _textView.backgroundColor = UIColor.clearColor;
+    _textView.textColor = [UIColor colorWithRed:0.92 green:0.94 blue:0.96 alpha:1.0];
+    UIFont *mono = [UIFont fontWithName:@"Menlo" size:11];
+    _textView.font = mono ?: [UIFont systemFontOfSize:11];
+    _textView.alwaysBounceVertical = YES;
+    _textView.showsVerticalScrollIndicator = YES;
+    _textView.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:_textView];
+
+    _copyBtn = [self ndButtonWithTitle:@"复制" action:@selector(ndCopy)];
+    UIButton *shareBtn = [self ndButtonWithTitle:@"转发" action:@selector(ndShare)];
+    UIButton *closeBtn = [self ndButtonWithTitle:@"关闭" action:@selector(ndClose)];
+    _copyBtn.backgroundColor = [UIColor colorWithRed:0.22 green:0.24 blue:0.28 alpha:1.0];
+    shareBtn.backgroundColor = [UIColor colorWithRed:0.10 green:0.55 blue:0.95 alpha:1.0];
+    closeBtn.backgroundColor = [UIColor colorWithRed:0.22 green:0.24 blue:0.28 alpha:1.0];
+    [card addSubview:_copyBtn];
+    [card addSubview:shareBtn];
+    [card addSubview:closeBtn];
+
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [card.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [card.centerYAnchor constraintEqualToAnchor:safe.centerYAnchor],
+        [card.widthAnchor constraintEqualToAnchor:safe.widthAnchor multiplier:0.92],
+        [card.heightAnchor constraintEqualToAnchor:safe.heightAnchor multiplier:0.80],
+
+        [title.topAnchor constraintEqualToAnchor:card.topAnchor constant:14],
+        [title.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+
+        [closeX.centerYAnchor constraintEqualToAnchor:title.centerYAnchor],
+        [closeX.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
+        [closeX.widthAnchor constraintEqualToConstant:30],
+
+        [_textView.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:10],
+        [_textView.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
+        [_textView.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
+        [_textView.bottomAnchor constraintEqualToAnchor:_copyBtn.topAnchor constant:-12],
+
+        [closeBtn.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-14],
+        [closeBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
+        [closeBtn.widthAnchor constraintEqualToConstant:80],
+        [closeBtn.heightAnchor constraintEqualToConstant:40],
+
+        [shareBtn.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-14],
+        [shareBtn.trailingAnchor constraintEqualToAnchor:closeBtn.leadingAnchor constant:-10],
+        [shareBtn.widthAnchor constraintEqualToConstant:80],
+        [shareBtn.heightAnchor constraintEqualToConstant:40],
+
+        [_copyBtn.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-14],
+        [_copyBtn.trailingAnchor constraintEqualToAnchor:shareBtn.leadingAnchor constant:-10],
+        [_copyBtn.widthAnchor constraintEqualToConstant:80],
+        [_copyBtn.heightAnchor constraintEqualToConstant:40],
+    ]];
+}
+
+// 仅当触摸落在遮罩本身时才响应关闭，点卡片内部不关闭
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
+    return touch.view == self.view;
+}
+
+- (void)ndClose {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)ndCopy {
+    [UIPasteboard generalPasteboard].string = self.report ?: @"";
+    [_copyBtn setTitle:@"已复制" forState:UIControlStateNormal];
+    __weak UIButton *weakBtn = _copyBtn;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakBtn setTitle:@"复制" forState:UIControlStateNormal];
+    });
+}
+
+- (void)ndShare {
+    NSString *r = self.report;
+    [self dismissViewControllerAnimated:NO completion:^{
+        UIActivityViewController *ac = [[UIActivityViewController alloc]
+            initWithActivityItems:@[r ?: @""] applicationActivities:nil];
+        UIViewController *top = NDTopVC();
+        if (top) [top presentViewController:ac animated:YES completion:nil];
+    }];
+}
+
+@end
+
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-01\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-02\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -1425,10 +1585,9 @@ static void NDShowReport(void) {
         [r appendString:@"\nEBAppLogDeviceHelper：(类未加载，进 App 后再看)\n"];
     }
 
-    UIActivityViewController *ac = [[UIActivityViewController alloc] initWithActivityItems:@[r]
-                                                                      applicationActivities:nil];
+    NDReportVC *rc = [[NDReportVC alloc] initWithReport:r];
     UIViewController *top = NDTopVC();
-    if (top) [top presentViewController:ac animated:YES completion:nil];
+    if (top) [top presentViewController:rc animated:YES completion:nil];
 }
 
 static void NDSetupFloatButton(void) {
@@ -1444,7 +1603,7 @@ static void NDSetupFloatButton(void) {
             b.backgroundColor = [UIColor colorWithRed:0.10 green:0.55 blue:0.95 alpha:0.85];
             b.titleLabel.font = [UIFont boldSystemFontOfSize:13];
             b.titleLabel.numberOfLines = 2;
-            [b setTitle:@"网盘\n伪装" forState:UIControlStateNormal];
+            [b setTitle:@"网解\n伪装" forState:UIControlStateNormal];
             [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
             [b addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
                 NDShowReport();

@@ -3,13 +3,13 @@
 两个产物：
 
 - **NDSpoofer_9.20-01.dylib（卐解）**：TrollFools 注入百度网盘（com.baidu.netdisk）。
-- **NDSpooferCraneManager_9.20-01_RootHide.deb（网盘解/卍解）**：RootHide 管理器，为每个 Crane 容器写入独立配置。
+- **NDSpooferCraneManager_9.20-01_RootHide.deb（网解/卍解）**：RootHide 管理器，为每个 Crane 容器写入独立配置。
 
 ## 工作流程
 
 1. TrollFools 把 dylib 注入百度网盘。
-2. Sileo 安装网盘解 deb，桌面出现「网盘解」。
-3. 打开网盘解，勾选容器，点「一键随机网盘身份」。每个容器独立抽一套：
+2. Sileo 安装网解 deb，桌面出现「网解」。
+3. 打开网解，勾选容器，点「一键随机网盘身份」。每个容器独立抽一套：
    - 机型：iPhone 8（iPhone10,1 / D20AP / 2GB）或 iPhone SE3（iPhone14,6 / D49AP / 4GB）
    - 两机均为 375×667 @2x / 750×1334，与真机 SE2 完全同屏，UIScreen 不 hook，不存在机型/屏幕矛盾。
    - 系统版本：在该机型支持范围内随机（iPhone 8 到 16.x，SE3 到 18.x），build 与版本严格对应。
@@ -34,4 +34,4 @@
 
 ## 恢复
 
-网盘解里点「恢复安全」即关闭全部伪装（dylib 完全透传）；卸载 dylib 需 TrollFools 移除。
+网解里点「恢复安全」即关闭全部伪装（dylib 完全透传）；卸载 dylib 需 TrollFools 移除。

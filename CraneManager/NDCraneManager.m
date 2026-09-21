@@ -1,7 +1,9 @@
 //
-//  NDCraneManager.m  —  网盘解（卍解）：为百度网盘的 Crane 容器逐容器写入 NDSpoofer 配置
+//  NDCraneManager.m  —  网解（卍解）：为百度网盘的 Crane 容器逐容器写入 NDSpoofer 配置
 //
-//  版本：9.21-01
+//  版本：9.21-02
+//
+//  9.21-02：管理器与悬浮球名称统一改为“网解”。
 //
 //  用法：多选容器 → 一键随机网盘身份（每个容器一套独立机型/系统/IDFV）。
 //  9.21-01：机型池扩到 36 套（iPhone 8 ~ iPhone 17 系列，含异屏机型），每套带真实
@@ -401,7 +403,7 @@ static void *NDLoadCraneLibrary(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"网盘解";
+    self.title = @"网解";
     self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
     self.selectedContainerIDs = [NSMutableSet set];
     self.tableView.rowHeight = 84.0;
