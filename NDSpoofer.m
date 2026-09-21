@@ -1,7 +1,11 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-17
+//  版本：9.21-18
+//
+//  9.21-18：同一笔登录记录是 iPhone (iOS18.1.1)，登录设备仍未知。记录看 UA，
+//  设备看 di。源头 hook freeDiskSize（[22] 仍是真机约 34GB 空闲）和
+//  localIPAddress / getIPAddress:（[26] fe80 真机网卡）。不注入 JS。
 //
 //  9.21-17：16 在自洽 iPhone10,3 上 [14]=false，不是 CPU。15 曾把 CPU 字符串写进
 //  这个格子。停改 [14]。报告打出全部 SOH 字段，对照 SE2 泄漏。不注入 JS。
@@ -478,7 +482,7 @@ static NSString *NDRewriteDeviceInfoLine(NSString *s, NDConfig *c) {
 }
 
 // SAPI 明文设备串以 \x01（SOH）分隔。运行时：[3] PhoneModel [4] SystemVersion
-// [20] ram(KB) [21] disk(KB)。[14] 实测是 false，不是 CPU，16 起不再改。
+// [20] ram(KB) [21] disk(KB) [22] freeDisk [26] localIP。[14] 是 false，不是 CPU。
 static NSString *NDRewriteSapiPlain(NSString *s, NDConfig *c) {
     if (![s isKindOfClass:NSString.class] || !s.length) return s;
     NSString *sep = @"\x01";
@@ -503,6 +507,9 @@ static NSString *NDRewriteSapiPlain(NSString *s, NDConfig *c) {
         if (f[21].longLongValue != want)
             f[21] = [NSString stringWithFormat:@"%lld", want];
     }
+    if (f.count > 26 && f[26].length &&
+        ([f[26] containsString:@":"] || [f[26] containsString:@"."]))
+        f[26] = @"";
     return [f componentsJoinedByString:sep];
 }
 
@@ -690,6 +697,9 @@ static IMP nd_o_sapiRetrieve = NULL;
 static IMP nd_o_sapiGenerate = NULL;
 static IMP nd_o_sapiSetCookie = NULL;
 static IMP nd_o_sapiNotAllowedDI = NULL;
+static IMP nd_o_sapiFreeDisk = NULL;
+static IMP nd_o_sapiLocalIP = NULL;
+static IMP nd_o_sapiGetIP = NULL;
 static IMP nd_o_uaGet = NULL;
 static IMP nd_o_uaCompose = NULL;
 static IMP nd_o_physMem = NULL;       // NSProcessInfo physicalMemory
@@ -906,6 +916,50 @@ static BOOL nd_hook_sapiNotAllowedDI(id self, SEL _cmd, unsigned long long idx) 
     return nd_o_sapiNotAllowedDI
         ? ((BOOL (*)(id, SEL, unsigned long long))nd_o_sapiNotAllowedDI)(self, _cmd, idx)
         : NO;
+}
+
+// 把 SAPI 返回的容量值按 fake/real 缩放，保持原类型（NSString / NSNumber）和单位。
+static id NDScaleSapiBytes(id orig, uint64_t fakeBytes, uint64_t realBytes, BOOL isFree) {
+    if (!orig || fakeBytes == 0 || realBytes == 0 || fakeBytes == realBytes) return orig;
+    BOOL isStr = [orig isKindOfClass:NSString.class];
+    BOOL isNum = [orig isKindOfClass:NSNumber.class];
+    if (!isStr && !isNum) return orig;
+    long long v = isStr ? ((NSString *)orig).longLongValue : ((NSNumber *)orig).longLongValue;
+    if (v <= 0) return orig;
+    long long fake, real;
+    if (v > (long long)(realBytes / 512ULL)) {
+        fake = (long long)fakeBytes;
+        real = (long long)realBytes;
+    } else {
+        fake = (long long)(fakeBytes / 1024ULL);
+        real = (long long)(realBytes / 1024ULL);
+    }
+    if (real <= 0) return orig;
+    long long outv = isFree ? (v * fake / real) : fake;
+    if (isFree) {
+        if (outv < 1) outv = 1;
+        if (fake > 1 && outv >= fake) outv = fake - 1;
+    }
+    if (isStr) return [NSString stringWithFormat:@"%lld", outv];
+    return @(outv);
+}
+
+static id nd_hook_sapiFreeDisk(id self, SEL _cmd) {
+    id orig = nd_o_sapiFreeDisk ? ((id (*)(id, SEL))nd_o_sapiFreeDisk)(self, _cmd) : nil;
+    NDConfig *c = NDCurrentConfig();
+    if (!c.enabled || !c.spoofStorage || c.diskSizeGB <= 0 || c.realDiskBytes == 0) return orig;
+    uint64_t fake = (uint64_t)c.diskSizeGB * 1024ULL * 1024ULL * 1024ULL;
+    return NDScaleSapiBytes(orig, fake, c.realDiskBytes, YES);
+}
+static id nd_hook_sapiLocalIP(id self, SEL _cmd) {
+    NDConfig *c = NDCurrentConfig();
+    if (c.enabled && c.spoofBaiduSDK) return @"";
+    return nd_o_sapiLocalIP ? ((id (*)(id, SEL))nd_o_sapiLocalIP)(self, _cmd) : @"";
+}
+static id nd_hook_sapiGetIP(id self, SEL _cmd, BOOL flag) {
+    NDConfig *c = NDCurrentConfig();
+    if (c.enabled && c.spoofBaiduSDK) return @"";
+    return nd_o_sapiGetIP ? ((id (*)(id, SEL, BOOL))nd_o_sapiGetIP)(self, _cmd, flag) : @"";
 }
 
 static void nd_hook_handleLogin(id self, SEL _cmd, id model, id extra) {
@@ -1617,6 +1671,12 @@ static void NDInstallAll(void) {
                  'v', 0, "", (IMP)nd_hook_sapiSetCookie, &nd_o_sapiSetCookie);
     NDInstallOne(@"SAPIDeviceInfoHelper", NSSelectorFromString(@"notAllowedGetDI:"), YES,
                  'B', 1, "Q", (IMP)nd_hook_sapiNotAllowedDI, &nd_o_sapiNotAllowedDI);
+    NDInstallOne(@"SAPIDeviceInfoHelper", NSSelectorFromString(@"freeDiskSize"), YES, '@', 0, "",
+                 (IMP)nd_hook_sapiFreeDisk, &nd_o_sapiFreeDisk);
+    NDInstallOne(@"SAPIDeviceInfoHelper", NSSelectorFromString(@"localIPAddress"), YES, '@', 0, "",
+                 (IMP)nd_hook_sapiLocalIP, &nd_o_sapiLocalIP);
+    NDInstallOne(@"SAPIDeviceInfoHelper", NSSelectorFromString(@"getIPAddress:"), YES, '@', 1, "B",
+                 (IMP)nd_hook_sapiGetIP, &nd_o_sapiGetIP);
 
     // 悬浮球收边：只认 SAPI 登录成功 / 登出，不拿 BDUSS、不拿验证码页当登录。
     NDInstallOne(@"SAPILoginService", NSSelectorFromString(@"handleLoginWithModel:extraInfo:"), NO,
@@ -2513,7 +2573,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-17\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-18\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -2619,7 +2679,7 @@ static void NDShowReport(void) {
     [r appendString:@"看最近内容里的 has_di。登录 POST 有 di 仍未知 → 看下面明文字段是否自洽。\n"];
     [r appendString:@"登录后看「登录设备」最新一条。\n"];
 
-    [r appendString:@"\n—— 加密前 di 明文（9.21-17）——\n"];
+    [r appendString:@"\n—— 加密前 di 明文（9.21-18）——\n"];
     [r appendFormat:@"采样：%d  其中有SOH：%d  字段数：%d\n", g_plainN, g_plainSohN, g_plainCnt];
     [r appendFormat:@"[3] PhoneModel：%@\n", g_plainPM ?: @"(无)"];
     [r appendFormat:@"[4] SystemVersion：%@\n", g_plainVer ?: @"(无)"];
@@ -2627,7 +2687,7 @@ static void NDShowReport(void) {
     [r appendFormat:@"[21] disk(KB)：%@\n", g_plainDsk ?: @"(无)"];
     [r appendFormat:@"配置内存：%ldMB  磁盘：%ldGB  CPU：%@\n",
         (long)c.memorySizeMB, (long)c.diskSizeGB, c.cpuBrand ?: @"-"];
-    [r appendString:@"[14] 实测是 false，不再当 CPU 改。下面是全部字段。\n"];
+    [r appendString:@"[22] 应随伪装磁盘放大，[26] 应空（不要再是 fe80）。下面是全部字段。\n"];
     if (g_plainAll.count) {
         NSUInteger n = MIN((NSUInteger)g_plainAll.count, (NSUInteger)48);
         for (NSUInteger i = 0; i < n; i++) {
