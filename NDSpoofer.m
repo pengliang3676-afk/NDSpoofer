@@ -1,7 +1,10 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-06
+//  版本：9.21-07
+//
+//  9.21-07：网解自检增加 Passport H5 探针（只记 URL / 该 WebView 仓库有没有 DVIF，不改登录、不注入 JS）。
+//  用来判断「未知设备」是 DVIF 没进登录 WebView，还是进了但 Passport 根本不看 Cookie。
 //
 //  9.21-06：悬浮球放到独立 UIWindow（不抢 keyWindow），验证码弹层关掉后球还在；点击空白穿透。
 //
@@ -844,6 +847,8 @@ static NSArray<NSHTTPCookie *> *NDDVIFCookiesFromShared(void) {
     return out;
 }
 
+static void NDNoteStoreDVIF(id store);
+
 static void NDSyncDVIFToStore(id store, void (^done)(void)) {
     void (^finish)(void) = ^{
         if (!done) return;
@@ -853,7 +858,11 @@ static void NDSyncDVIFToStore(id store, void (^done)(void)) {
     if (!store) { finish(); return; }
     NSArray *cks = NDDVIFCookiesFromShared();
     SEL setSel = @selector(setCookie:completionHandler:);
-    if (!cks.count || ![store respondsToSelector:setSel]) { finish(); return; }
+    if (!cks.count || ![store respondsToSelector:setSel]) {
+        NDNoteStoreDVIF(store);
+        finish();
+        return;
+    }
     dispatch_group_t grp = dispatch_group_create();
     for (NSHTTPCookie *c in cks) {
         dispatch_group_enter(grp);
@@ -861,7 +870,10 @@ static void NDSyncDVIFToStore(id store, void (^done)(void)) {
             dispatch_group_leave(grp);
         });
     }
-    dispatch_group_notify(grp, dispatch_get_main_queue(), finish);
+    dispatch_group_notify(grp, dispatch_get_main_queue(), ^{
+        NDNoteStoreDVIF(store);
+        finish();
+    });
 }
 
 static NSURLRequest *NDRequestAppendingDVIFCookie(NSURLRequest *req) {
@@ -921,6 +933,63 @@ static BOOL NDURLNeedsDVIF(NSURL *u) {
     NSString *h = u.host.lowercaseString ?: @"";
     return [h containsString:@"wappass"] || [h containsString:@"passport"] ||
            [h containsString:@"baidu"];
+}
+
+// Passport H5 只读计数：不改请求，只给网解自检看。
+static NSString *g_h5LastURL = nil;
+static int g_h5LoadN = 0, g_h5LoadDVIF = 0;
+static int g_h5NavN = 0, g_h5NavDVIF = 0;
+static int g_h5HttpN = 0, g_h5HttpDVIF = 0;
+static int g_h5StoreDVIF = -1;
+
+static NSString *NDShortPassURL(NSURL *u) {
+    if (!u) return @"-";
+    NSString *h = u.host ?: @"";
+    NSString *p = u.path.length ? u.path : @"/";
+    if (p.length > 96) p = [[p substringToIndex:96] stringByAppendingString:@"…"];
+    return [NSString stringWithFormat:@"%@%@", h, p];
+}
+
+static BOOL NDURLLooksPass(NSURL *u) {
+    NSString *h = (u.host ?: @"").lowercaseString;
+    NSString *p = (u.path ?: @"").lowercaseString;
+    if ([h containsString:@"wappass"] || [h containsString:@"passport"]) return YES;
+    if ([p containsString:@"historylist"] || [p containsString:@"getonlineapp"]) return YES;
+    if ([p containsString:@"/v3/api/device/"] || [p containsString:@"accountsecurity"]) return YES;
+    return NO;
+}
+
+static void NDNotePassReq(NSString *via, NSURLRequest *req) {
+    if (![req isKindOfClass:NSURLRequest.class] || !req.URL) return;
+    if (!NDURLLooksPass(req.URL) && !NDURLNeedsDVIF(req.URL)) return;
+    NSString *s = NDShortPassURL(req.URL);
+    if (s.length) g_h5LastURL = [s copy];
+    BOOL dv = NDRequestHasDVIF(req);
+    if ([via isEqualToString:@"load"]) {
+        g_h5LoadN++;
+        if (dv) g_h5LoadDVIF++;
+    } else if ([via isEqualToString:@"nav"]) {
+        g_h5NavN++;
+        if (dv) g_h5NavDVIF++;
+    } else {
+        g_h5HttpN++;
+        if (dv) g_h5HttpDVIF++;
+    }
+}
+
+static void NDNoteStoreDVIF(id store) {
+    if (!store) return;
+    SEL s = @selector(getAllCookies:);
+    if (![store respondsToSelector:s]) return;
+    ((void (*)(id, SEL, void (^)(NSArray *)))objc_msgSend)(store, s, ^(NSArray *cks) {
+        int has = 0;
+        for (id obj in cks) {
+            if (![obj isKindOfClass:NSHTTPCookie.class]) continue;
+            NSHTTPCookie *c = obj;
+            if ([c.name isEqualToString:@"DVIF"] && c.value.length) { has = 1; break; }
+        }
+        g_h5StoreDVIF = has;
+    });
 }
 
 static id NDCookieStoreFromWebView(id wv) {
@@ -1266,6 +1335,8 @@ static SEL g_nduSelWkSetUA = NULL;
 static SEL g_nduSelWkLoad = NULL;
 static SEL g_nduSelPassLoad = NULL;
 static SEL g_nduSelPassInitWK = NULL;
+static SEL g_nduSelPassDecide = NULL;
+static SEL g_nduSelPassShould = NULL;
 static SEL g_nduSelSapiLoadCk = NULL;
 static SEL g_nduSelWkDefaultUA = NULL;
 static SEL g_nduSelSetHdr = NULL;
@@ -1290,6 +1361,7 @@ static id ndu_tr_wkLoad(id self, SEL _cmd, id req) {
     NSURLRequest *r = [req isKindOfClass:NSURLRequest.class] ? (NSURLRequest *)req : nil;
     NDConfig *c = NDCurrentConfig();
     if (!r || !c || !c.enabled || !c.spoofBaiduSDK || !NDURLNeedsDVIF(r.URL) || NDRequestHasDVIF(r)) {
+        NDNotePassReq(@"load", r);
         return ((id(*)(id, SEL, id))objc_msgSend)(self, g_nduSelWkLoad, req);
     }
     NDEnsureDeviceCookie();
@@ -1299,6 +1371,7 @@ static id ndu_tr_wkLoad(id self, SEL _cmd, id req) {
         if (went) return;
         went = YES;
         NSURLRequest *out = NDRequestAppendingDVIFCookie(r);
+        NDNotePassReq(@"load", out);
         nav = ((id(*)(id, SEL, id))objc_msgSend)(self, g_nduSelWkLoad, out);
     };
     NDSyncDVIFToStore(NDCookieStoreFromWebView(self), go);
@@ -1312,6 +1385,7 @@ static id ndu_tr_passLoad(id self, SEL _cmd, id req) {
     NSURLRequest *r = [req isKindOfClass:NSURLRequest.class] ? (NSURLRequest *)req : nil;
     NDConfig *c = NDCurrentConfig();
     if (!r || !c || !c.enabled || !c.spoofBaiduSDK || !NDURLNeedsDVIF(r.URL)) {
+        NDNotePassReq(@"load", r);
         return ((id(*)(id, SEL, id))objc_msgSend)(self, g_nduSelPassLoad, req);
     }
     NDEnsureDeviceCookie();
@@ -1322,6 +1396,7 @@ static id ndu_tr_passLoad(id self, SEL _cmd, id req) {
         if (went) return;
         went = YES;
         NSURLRequest *out = NDRequestAppendingDVIFCookie(r);
+        NDNotePassReq(@"load", out);
         nav = ((id(*)(id, SEL, id))objc_msgSend)(self, g_nduSelPassLoad, out);
     };
     NDSyncDVIFToStore(NDCookieStoreFromWebView(wv ?: self), go);
@@ -1336,6 +1411,23 @@ static void ndu_tr_passInitWK(id self, SEL _cmd) {
     if (!c || !c.enabled || !c.spoofBaiduSDK) return;
     NDEnsureDeviceCookie();
     NDSyncDVIFToStore(NDCookieStoreFromWebView(NDRealWebView(self)), nil);
+}
+
+static void ndu_tr_passDecide(id self, SEL _cmd, id wv, id action, id handler) {
+    NSURLRequest *req = nil;
+    @try {
+        if ([action respondsToSelector:@selector(request)])
+            req = ((id (*)(id, SEL))objc_msgSend)(action, @selector(request));
+    } @catch (__unused NSException *e) {}
+    NDNotePassReq(@"nav", req);
+    id storeWV = NDRealWebView(self);
+    NDNoteStoreDVIF(NDCookieStoreFromWebView(storeWV ?: wv));
+    ((void (*)(id, SEL, id, id, id))objc_msgSend)(self, g_nduSelPassDecide, wv, action, handler);
+}
+
+static BOOL ndu_tr_passShould(id self, SEL _cmd, id req, long long navType) {
+    NDNotePassReq(@"nav", req);
+    return ((BOOL (*)(id, SEL, id, long long))objc_msgSend)(self, g_nduSelPassShould, req, navType);
 }
 
 static void ndu_tr_sapiLoadCk(id self, SEL _cmd, id url, id cookies) {
@@ -1378,6 +1470,7 @@ static void ndu_tr_setHdr(id self, SEL _cmd, id value, id field) {
 
 // 4) NSURLSession dataTask 出口：复制请求并改写 UA 头（覆盖 native 登录链）
 static NSURLRequest *NDURewriteRequest(NSURLRequest *req, NSURLSession *session, NDConfig *c) {
+    NDNotePassReq(@"http", req);
     if (g_nduInRewrite || !c.enabled || !c.spoofUA || ![req isKindOfClass:NSURLRequest.class])
         return req;
     __block NSString *ua = nil;
@@ -1466,6 +1559,14 @@ static void NDUScanPass(void) {
             Method mi = NDUOwnMethod(pass, initWK);
             if (mi) NDUSwap(pass, initWK, (IMP)ndu_tr_passInitWK,
                             g_nduSelPassInitWK, method_getTypeEncoding(mi));
+            SEL decide = @selector(webView:decidePolicyForNavigationAction:decisionHandler:);
+            Method md = NDUOwnMethod(pass, decide);
+            if (md) NDUSwap(pass, decide, (IMP)ndu_tr_passDecide,
+                            g_nduSelPassDecide, method_getTypeEncoding(md));
+            SEL should = NSSelectorFromString(@"internal_webViewShouldStartLoadWithRequest:navigationType:");
+            Method ms = NDUOwnMethod(pass, should);
+            if (ms) NDUSwap(pass, should, (IMP)ndu_tr_passShould,
+                            g_nduSelPassShould, method_getTypeEncoding(ms));
         }
         Class swv = NSClassFromString(@"SAPIWebView");
         if (swv) {
@@ -1952,7 +2053,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-06\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-07\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -2017,6 +2118,20 @@ static void NDShowReport(void) {
     } else {
         [r appendString:@"\nEBAppLogDeviceHelper：(类未加载，进 App 后再看)\n"];
     }
+
+    [r appendString:@"\n—— Passport H5 自检（9.21-07，只读）——\n"];
+    [r appendFormat:@"最近 URL：%@\n", g_h5LastURL ?: @"(还没看到 Passport/wappass 导航)"];
+    NSArray *sharedDV = NDDVIFCookiesFromShared();
+    [r appendFormat:@"系统 Cookie 仓库 DVIF：%@（%lu 条）\n",
+        sharedDV.count ? @"有" : @"无", (unsigned long)sharedDV.count];
+    [r appendFormat:@"登录 WebView 仓库 DVIF：%@\n",
+        g_h5StoreDVIF < 0 ? @"未读到" : (g_h5StoreDVIF ? @"有" : @"无")];
+    [r appendFormat:@"PASSWebView loadRequest：%d 次，Cookie头带 DVIF：%d\n", g_h5LoadN, g_h5LoadDVIF];
+    [r appendFormat:@"PASSWebView 主文档导航：%d 次，Cookie头带 DVIF：%d\n", g_h5NavN, g_h5NavDVIF];
+    [r appendFormat:@"原生 HTTP(Passport相关)：%d 次，Cookie头带 DVIF：%d\n", g_h5HttpN, g_h5HttpDVIF];
+    [r appendString:@"读法：仓库「有」但登录设备仍未知 → Passport 登录不看 DVIF。\n"];
+    [r appendString:@"仓库「无」→ DVIF 没进登录 WebView。\n"];
+    [r appendString:@"Cookie 头经常是 0（WK 把 Cookie 放仓库不放头），以仓库为准。\n"];
 
     NDReportVC *rc = [[NDReportVC alloc] initWithReport:r];
     UIViewController *host = NDFloatHostVC();
