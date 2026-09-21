@@ -1,7 +1,11 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-08
+//  版本：9.21-09
+//
+//  9.21-09：H5 登录不调 mini_di。改为在原生打开 WAP 登录页时把 PhoneModel / device_name /
+//  SystemVersion 写进 URL 查询串和 extraParams（PASSWebView loadRequest、loadLogin extraParams、
+//  extraQueryParams、addBaseQueryToURLString）。不注入 JS。
 //
 //  9.21-08：定位到 H5 用 -[PASSWebViewController sapi_action_mini_di:] 向原生要 di_keys，
 //  再经 retrieveDeviceInfoForKeys: 回传。网解自检只读记下 keys 与回包里的 PhoneModel /
@@ -658,6 +662,13 @@ static IMP nd_o_loginSuccessful = NULL;
 static IMP nd_o_logoutCurrent = NULL;
 static IMP nd_o_miniDi = NULL;
 static IMP nd_o_cbUserInfo = NULL;
+static IMP nd_o_extraQP = NULL;
+static IMP nd_o_allExtraQP = NULL;
+static IMP nd_o_loadLoginType = NULL;
+static IMP nd_o_loadLoginCfg = NULL;
+static IMP nd_o_addBaseQS = NULL;
+
+static NSDictionary *NDMergeWapDict(id extra);
 
 static void NDFloatOnLoginSuccess(void);
 static void NDFloatOnLogout(void);
@@ -899,6 +910,31 @@ static void nd_hook_cbUserInfo(id self, SEL _cmd, id command, id info) {
         ((void (*)(id, SEL, id, id))nd_o_cbUserInfo)(self, _cmd, command, info);
 }
 
+static id nd_hook_extraQP(id self, SEL _cmd) {
+    id orig = nd_o_extraQP ? ((id (*)(id, SEL))nd_o_extraQP)(self, _cmd) : nil;
+    return NDMergeWapDict(orig);
+}
+static id nd_hook_allExtraQP(id self, SEL _cmd) {
+    id orig = nd_o_allExtraQP ? ((id (*)(id, SEL))nd_o_allExtraQP)(self, _cmd) : nil;
+    return NDMergeWapDict(orig);
+}
+static void nd_hook_loadLoginType(id self, SEL _cmd, long long type, id extra) {
+    id merged = NDMergeWapDict(extra);
+    if (nd_o_loadLoginType)
+        ((void (*)(id, SEL, long long, id))nd_o_loadLoginType)(self, _cmd, type, merged);
+}
+static void nd_hook_loadLoginCfg(id self, SEL _cmd, id cfg, id extra) {
+    id merged = NDMergeWapDict(extra);
+    if (nd_o_loadLoginCfg)
+        ((void (*)(id, SEL, id, id))nd_o_loadLoginCfg)(self, _cmd, cfg, merged);
+}
+static id nd_hook_addBaseQS(id self, SEL _cmd, id url, id other) {
+    id merged = other;
+    if ([other isKindOfClass:NSDictionary.class] || other == nil)
+        merged = NDMergeWapDict(other);
+    return nd_o_addBaseQS ? ((id (*)(id, SEL, id, id))nd_o_addBaseQS)(self, _cmd, url, merged) : url;
+}
+
 static int g_ndInSetCookie = 0;
 
 static NSArray<NSHTTPCookie *> *NDDVIFCookiesFromShared(void) {
@@ -935,6 +971,76 @@ static NSArray<NSHTTPCookie *> *NDDVIFCookiesFromShared(void) {
 }
 
 static void NDNoteStoreDVIF(id store);
+static NSString *NDShortPassURL(NSURL *u);
+
+static int g_wapParamN = 0;
+static NSString *g_wapParamVia = nil;
+static NSString *g_wapParamLast = nil;
+
+static NSDictionary *NDWapDeviceDict(void) {
+    NDConfig *c = NDCurrentConfig();
+    if (!c || !c.enabled || !c.spoofBaiduSDK || !c.hwMachine.length) return nil;
+    NSMutableDictionary *m = [NSMutableDictionary dictionary];
+    m[@"PhoneModel"] = c.hwMachine;
+    m[@"device_name"] = @"iPhone";
+    if (c.systemVersion.length) m[@"SystemVersion"] = c.systemVersion;
+    return m;
+}
+
+static void NDNoteWapParam(NSString *via, NSString *detail) {
+    g_wapParamN++;
+    g_wapParamVia = [via copy];
+    if (detail.length) g_wapParamLast = [detail copy];
+}
+
+static NSDictionary *NDMergeWapDict(id extra) {
+    NSDictionary *add = NDWapDeviceDict();
+    if (!add) return extra;
+    NSMutableDictionary *m = [NSMutableDictionary dictionary];
+    if ([extra isKindOfClass:NSDictionary.class]) [m addEntriesFromDictionary:(NSDictionary *)extra];
+    [add enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+        if (![m[k] isKindOfClass:NSString.class] || ![((NSString *)m[k]) length])
+            m[k] = v;
+    }];
+    NDNoteWapParam(@"extraParams", [NSString stringWithFormat:@"PhoneModel=%@", add[@"PhoneModel"]]);
+    return m;
+}
+
+static NSURL *NDURLByAddingWapDevice(NSURL *u, NSString *via) {
+    if (![u isKindOfClass:NSURL.class] || !u.host.length) return u;
+    NSString *h = u.host.lowercaseString;
+    if (![h containsString:@"wappass"] && ![h containsString:@"passport"]) return u;
+    NSDictionary *add = NDWapDeviceDict();
+    if (!add) return u;
+    NSString *abs = u.absoluteString ?: @"";
+    if ([abs containsString:@"PhoneModel="]) {
+        NDNoteWapParam(via, [NSString stringWithFormat:@"already %@", NDShortPassURL(u)]);
+        return u;
+    }
+    NSURLComponents *comp = [NSURLComponents componentsWithURL:u resolvingAgainstBaseURL:NO];
+    if (!comp) return u;
+    NSMutableArray *items = [NSMutableArray array];
+    if (comp.queryItems.count) [items addObjectsFromArray:comp.queryItems];
+    [add enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
+        for (NSURLQueryItem *it in items) {
+            if ([it.name isEqualToString:k]) return;
+        }
+        [items addObject:[NSURLQueryItem queryItemWithName:k value:v]];
+    }];
+    comp.queryItems = items;
+    NSURL *out = comp.URL ?: u;
+    NDNoteWapParam(via, [NSString stringWithFormat:@"PhoneModel=%@ %@", add[@"PhoneModel"], NDShortPassURL(out)]);
+    return out;
+}
+
+static NSURLRequest *NDRequestByAddingWapDevice(NSURLRequest *req, NSString *via) {
+    if (![req isKindOfClass:NSURLRequest.class]) return req;
+    NSURL *nu = NDURLByAddingWapDevice(req.URL, via);
+    if (!nu || nu == req.URL || [nu isEqual:req.URL]) return req;
+    NSMutableURLRequest *m = [req mutableCopy];
+    m.URL = nu;
+    return m;
+}
 
 static void NDSyncDVIFToStore(id store, void (^done)(void)) {
     void (^finish)(void) = ^{
@@ -1313,6 +1419,16 @@ static void NDInstallAll(void) {
                  'v', 1, "@", (IMP)nd_hook_miniDi, &nd_o_miniDi);
     NDInstallOne(@"SAPIWebView", NSSelectorFromString(@"callBackSuccessWithCommand:userInfo:"), NO,
                  'v', 2, "@@", (IMP)nd_hook_cbUserInfo, &nd_o_cbUserInfo);
+    NDInstallOne(@"PASSWebViewController", NSSelectorFromString(@"extraQueryParams"), NO,
+                 '@', 0, "", (IMP)nd_hook_extraQP, &nd_o_extraQP);
+    NDInstallOne(@"PASSWebViewController", NSSelectorFromString(@"allExtraQueryParams"), NO,
+                 '@', 0, "", (IMP)nd_hook_allExtraQP, &nd_o_allExtraQP);
+    NDInstallOne(@"SAPIWebView", NSSelectorFromString(@"loadLoginWithType:extraParams:"), NO,
+                 'v', 2, "q@", (IMP)nd_hook_loadLoginType, &nd_o_loadLoginType);
+    NDInstallOne(@"SAPIWebView", NSSelectorFromString(@"loadLoginWithConfig:extraParams:"), NO,
+                 'v', 2, "@@", (IMP)nd_hook_loadLoginCfg, &nd_o_loadLoginCfg);
+    NDInstallOne(@"SAPIURLHelper", NSSelectorFromString(@"addBaseQueryToURLString:otherQuery:"), YES,
+                 '@', 2, "@@", (IMP)nd_hook_addBaseQS, &nd_o_addBaseQS);
 
     // BDPUserAgent 实例方法
     NDInstallOne(@"BDPUserAgent", NSSelectorFromString(@"useagent_getDeviceInfo"), NO, '@', 0, "",
@@ -1461,7 +1577,7 @@ static id ndu_tr_wkLoad(id self, SEL _cmd, id req) {
     void (^go)(void) = ^{
         if (went) return;
         went = YES;
-        NSURLRequest *out = NDRequestAppendingDVIFCookie(r);
+        NSURLRequest *out = NDRequestByAddingWapDevice(NDRequestAppendingDVIFCookie(r), @"wkLoad");
         NDNotePassReq(@"load", out);
         nav = ((id(*)(id, SEL, id))objc_msgSend)(self, g_nduSelWkLoad, out);
     };
@@ -1486,7 +1602,7 @@ static id ndu_tr_passLoad(id self, SEL _cmd, id req) {
     void (^go)(void) = ^{
         if (went) return;
         went = YES;
-        NSURLRequest *out = NDRequestAppendingDVIFCookie(r);
+        NSURLRequest *out = NDRequestByAddingWapDevice(NDRequestAppendingDVIFCookie(r), @"passLoad");
         NDNotePassReq(@"load", out);
         nav = ((id(*)(id, SEL, id))objc_msgSend)(self, g_nduSelPassLoad, out);
     };
@@ -2144,7 +2260,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-08\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-09\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -2237,6 +2353,12 @@ static void NDShowReport(void) {
     [r appendFormat:@"回给 H5 SystemVersion：%@\n", g_cbVer ?: @"(无)"];
     [r appendString:@"读法：di_keys 不含 PhoneModel → H5 登录根本不要机型。\n"];
     [r appendString:@"keys 有 PhoneModel 且回包有值，登录设备仍未知 → Passport 不用这份机型。\n"];
+
+    [r appendString:@"\n—— WAP 登录参数（9.21-09）——\n"];
+    [r appendFormat:@"写入次数：%d\n", g_wapParamN];
+    [r appendFormat:@"最近出口：%@\n", g_wapParamVia ?: @"(还没写到登录 URL)"];
+    [r appendFormat:@"最近内容：%@\n", g_wapParamLast ?: @"-"];
+    [r appendString:@"登录后看「登录设备」最新一条。仍未知就换下一刀原生出口。\n"];
 
     NDReportVC *rc = [[NDReportVC alloc] initWithReport:r];
     UIViewController *host = NDFloatHostVC();
