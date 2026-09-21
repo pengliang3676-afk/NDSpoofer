@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VER="9.21-02"
+VER="9.21-03"
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 COMMON=(-isysroot "$SDK" -miphoneos-version-min=15.0 -fobjc-arc -fblocks -Werror=return-type -Werror=implicit-function-declaration)
 DYLIB_FW=(-framework Foundation -framework UIKit -framework CoreGraphics -framework CoreTelephony -framework Security)

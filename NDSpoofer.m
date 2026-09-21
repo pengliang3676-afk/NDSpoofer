@@ -1,7 +1,12 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-02
+//  版本：9.21-03
+//
+//  9.21-03：H5 短信登录（13.34.0 真机：不走 smsWap，设备列表仍「未知设备」）。
+//  NSHTTPCookieStorage 里已有 DVIF，但 WKWebView 用独立 WKHTTPCookieStore。
+//  登录 POST 发出前把 DVIF 同步进该 WebView 的 cookie store，并补到 loadRequest 的 Cookie 头。
+//  不注入 JS、不改 DOM。
 //
 //  9.21-02：悬浮球不再直接弹系统分享，改为在屏幕内弹出可滚动的自检报告卡片
 //  （可直接查看 / 复制 / 转发，点遮罩或关闭按钮收起）；管理器与悬浮球名称统一改为“网解”。
@@ -615,6 +620,7 @@ static IMP nd_o_sapiDeviceType = NULL;
 static IMP nd_o_sapiPlain = NULL;
 static IMP nd_o_sapiRetrieve = NULL;
 static IMP nd_o_sapiGenerate = NULL;
+static IMP nd_o_sapiSetCookie = NULL;
 static IMP nd_o_uaGet = NULL;
 static IMP nd_o_uaCompose = NULL;
 static IMP nd_o_physMem = NULL;       // NSProcessInfo physicalMemory
@@ -751,6 +757,103 @@ static id nd_hook_sapiGenerate(id self, SEL _cmd, id plain) {
         fed = NDRewriteSapiPlain(plain, c);
     }
     return nd_o_sapiGenerate ? ((id (*)(id, SEL, id))nd_o_sapiGenerate)(self, _cmd, fed) : fed;
+}
+
+static int g_ndInSetCookie = 0;
+
+static NSArray<NSHTTPCookie *> *NDDVIFCookiesFromShared(void) {
+    NSHTTPCookieStorage *st = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+    NSMutableArray *out = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    NSArray *all = nil;
+    @try { all = [st cookies]; } @catch (__unused NSException *e) { all = nil; }
+    for (NSHTTPCookie *c in all) {
+        if (![c isKindOfClass:NSHTTPCookie.class]) continue;
+        if (![c.name isEqualToString:@"DVIF"] || !c.value.length) continue;
+        NSString *k = [NSString stringWithFormat:@"%@|%@|%@", c.domain ?: @"", c.path ?: @"", c.name];
+        if ([seen containsObject:k]) continue;
+        [seen addObject:k];
+        [out addObject:c];
+    }
+    return out;
+}
+
+static void NDSyncDVIFToStore(id store, void (^done)(void)) {
+    void (^finish)(void) = ^{
+        if (!done) return;
+        if ([NSThread isMainThread]) done();
+        else dispatch_async(dispatch_get_main_queue(), done);
+    };
+    if (!store) { finish(); return; }
+    NSArray *cks = NDDVIFCookiesFromShared();
+    SEL setSel = @selector(setCookie:completionHandler:);
+    if (!cks.count || ![store respondsToSelector:setSel]) { finish(); return; }
+    dispatch_group_t grp = dispatch_group_create();
+    for (NSHTTPCookie *c in cks) {
+        dispatch_group_enter(grp);
+        ((void (*)(id, SEL, id, void (^)(void)))objc_msgSend)(store, setSel, c, ^{
+            dispatch_group_leave(grp);
+        });
+    }
+    dispatch_group_notify(grp, dispatch_get_main_queue(), finish);
+}
+
+static NSURLRequest *NDRequestAppendingDVIFCookie(NSURLRequest *req) {
+    if (![req isKindOfClass:NSURLRequest.class]) return req;
+    NSArray *cks = NDDVIFCookiesFromShared();
+    if (!cks.count) return req;
+    NSString *old = nil;
+    for (NSString *k in req.allHTTPHeaderFields) {
+        if ([k caseInsensitiveCompare:@"Cookie"] == NSOrderedSame) {
+            old = req.allHTTPHeaderFields[k];
+            break;
+        }
+    }
+    NSMutableArray *parts = [NSMutableArray array];
+    if (old.length) [parts addObject:old];
+    BOOL added = NO;
+    for (NSHTTPCookie *c in cks) {
+        NSString *mark = [c.name stringByAppendingString:@"="];
+        if (old.length && [old containsString:mark]) continue;
+        [parts addObject:[NSString stringWithFormat:@"%@=%@", c.name, c.value]];
+        added = YES;
+    }
+    if (!added) return req;
+    NSMutableURLRequest *m = [req mutableCopy];
+    [m setValue:[parts componentsJoinedByString:@"; "] forHTTPHeaderField:@"Cookie"];
+    return m;
+}
+
+static BOOL NDURLNeedsDVIF(NSURL *u) {
+    NSString *h = u.host.lowercaseString ?: @"";
+    return [h containsString:@"wappass"] || [h containsString:@"passport"] ||
+           [h containsString:@"baidu"];
+}
+
+static id NDCookieStoreFromWebView(id wv) {
+    id store = nil;
+    @try {
+        if (!wv || ![wv respondsToSelector:@selector(configuration)]) return nil;
+        id cfg = ((id (*)(id, SEL))objc_msgSend)(wv, @selector(configuration));
+        if (!cfg || ![cfg respondsToSelector:@selector(websiteDataStore)]) return nil;
+        id ds = ((id (*)(id, SEL))objc_msgSend)(cfg, @selector(websiteDataStore));
+        if (!ds || ![ds respondsToSelector:@selector(httpCookieStore)]) return nil;
+        store = ((id (*)(id, SEL))objc_msgSend)(ds, @selector(httpCookieStore));
+    } @catch (__unused NSException *e) { store = nil; }
+    return store;
+}
+
+static void nd_hook_sapiSetCookie(id self, SEL _cmd) {
+    if (nd_o_sapiSetCookie)
+        ((void (*)(id, SEL))nd_o_sapiSetCookie)(self, _cmd);
+    if (__sync_lock_test_and_set(&g_ndInSetCookie, 1)) return;
+    Class wkds = NSClassFromString(@"WKWebsiteDataStore");
+    if (wkds && [wkds respondsToSelector:@selector(defaultDataStore)]) {
+        id ds = ((id (*)(id, SEL))objc_msgSend)(wkds, @selector(defaultDataStore));
+        id store = ds ? ((id (*)(id, SEL))objc_msgSend)(ds, @selector(httpCookieStore)) : nil;
+        NDSyncDVIFToStore(store, nil);
+    }
+    __sync_lock_release(&g_ndInSetCookie);
 }
 
 // --- BDPUserAgent ---
@@ -943,6 +1046,8 @@ static void NDInstallAll(void) {
                  '@', 1, "@", (IMP)nd_hook_sapiRetrieve, &nd_o_sapiRetrieve);
     NDInstallOne(@"SAPIDeviceInfoHelper", NSSelectorFromString(@"generateDeviceInfoWithPlainString:"), YES,
                  '@', 1, "@", (IMP)nd_hook_sapiGenerate, &nd_o_sapiGenerate);
+    NDInstallOne(@"SAPICookieManager", NSSelectorFromString(@"setDeviceInfoToCookie"), YES,
+                 'v', 0, "", (IMP)nd_hook_sapiSetCookie, &nd_o_sapiSetCookie);
 
     // BDPUserAgent 实例方法
     NDInstallOne(@"BDPUserAgent", NSSelectorFromString(@"useagent_getDeviceInfo"), NO, '@', 0, "",
@@ -1053,6 +1158,7 @@ static BOOL NDUAContainsReal(NSString *s, NDConfig *c) {
 }
 
 static SEL g_nduSelWkSetUA = NULL;
+static SEL g_nduSelWkLoad = NULL;
 static SEL g_nduSelWkDefaultUA = NULL;
 static SEL g_nduSelSetHdr = NULL;
 static SEL g_nduSelDt1 = NULL;
@@ -1067,6 +1173,32 @@ static void ndu_tr_wkSetUA(id self, SEL _cmd, id ua) {
     if (c.enabled && c.spoofUA && [ua isKindOfClass:NSString.class] && NDUAContainsReal(ua, c))
         out = NDRewriteUA(ua, c);
     ((void(*)(id, SEL, id))objc_msgSend)(self, g_nduSelWkSetUA, out);
+    if (c && c.enabled && c.spoofBaiduSDK)
+        NDSyncDVIFToStore(NDCookieStoreFromWebView(self), nil);
+}
+
+// 1b) -[WKWebView loadRequest:]：登录页导航前把 DVIF 写入该 WebView 的 WKHTTPCookieStore
+static void ndu_tr_wkLoad(id self, SEL _cmd, id req) {
+    NSURLRequest *r = [req isKindOfClass:NSURLRequest.class] ? (NSURLRequest *)req : nil;
+    NDConfig *c = NDCurrentConfig();
+    if (!r || !c || !c.enabled || !c.spoofBaiduSDK || !NDURLNeedsDVIF(r.URL)) {
+        ((void(*)(id, SEL, id))objc_msgSend)(self, g_nduSelWkLoad, req);
+        return;
+    }
+    Class cm = NSClassFromString(@"SAPICookieManager");
+    SEL setDvif = NSSelectorFromString(@"setDeviceInfoToCookie");
+    if (cm && [cm respondsToSelector:setDvif])
+        ((void (*)(id, SEL))objc_msgSend)(cm, setDvif);
+    __block BOOL went = NO;
+    void (^go)(void) = ^{
+        if (went) return;
+        went = YES;
+        NSURLRequest *out = NDRequestAppendingDVIFCookie(r);
+        ((void(*)(id, SEL, id))objc_msgSend)(self, g_nduSelWkLoad, out);
+    };
+    NDSyncDVIFToStore(NDCookieStoreFromWebView(self), go);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), go);
 }
 
 // 2) -[BDPUserAgent webViewDefaultUserAgent]：裸 Mozilla 前缀源头
@@ -1168,6 +1300,9 @@ static void NDUScanPass(void) {
             Method m = NDUOwnMethod(wk, @selector(setCustomUserAgent:));
             if (m) NDUSwap(wk, @selector(setCustomUserAgent:), (IMP)ndu_tr_wkSetUA,
                            g_nduSelWkSetUA, method_getTypeEncoding(m));
+            Method ml = NDUOwnMethod(wk, @selector(loadRequest:));
+            if (ml) NDUSwap(wk, @selector(loadRequest:), (IMP)ndu_tr_wkLoad,
+                            g_nduSelWkLoad, method_getTypeEncoding(ml));
         }
         // 2. BDPUserAgent webViewDefaultUserAgent（裸前缀源头）
         Class bdp = NSClassFromString(@"BDPUserAgent");
@@ -1251,6 +1386,7 @@ static void NDInstallUAExits(void) {
         if (g_nduStarted) return;
         g_nduStarted = YES;
         g_nduSelWkSetUA = sel_registerName("ndu_orig_wkSetUA:");
+        g_nduSelWkLoad = sel_registerName("ndu_orig_wkLoad:");
         g_nduSelWkDefaultUA = sel_registerName("ndu_orig_wkDefaultUA");
         g_nduSelSetHdr = sel_registerName("ndu_orig_setHdr::");
         g_nduSelDt1 = sel_registerName("ndu_orig_dt1:");
@@ -1519,7 +1655,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-02\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-03\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
