@@ -1,7 +1,9 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-05
+//  版本：9.21-06
+//
+//  9.21-06：悬浮球放到独立 UIWindow（不抢 keyWindow），验证码弹层关掉后球还在；点击空白穿透。
 //
 //  9.21-05：悬浮球标题改为「网解」；只在 SAPI 登录成功回调后等 15 秒再收边。
 //  等验证码、短信页、登录 WebView 期间不算登录，球保持展开。登出后重新展开。
@@ -1645,7 +1647,21 @@ static void NDSeedPassCustom(NDConfig *c) {
 
 // ============================== 悬浮状态窗（只读自检） ==============================
 
+@interface NDFloatWindow : UIWindow
+@end
+@implementation NDFloatWindow
+- (BOOL)canBecomeKeyWindow {
+    return self.rootViewController.presentedViewController != nil;
+}
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (hit == self || hit == self.rootViewController.view) return nil;
+    return hit;
+}
+@end
+
 static UIButton *g_floatBtn = nil;
+static UIWindow *g_floatWin = nil;
 static BOOL g_floatDocked = NO;
 static BOOL g_floatDockTimerOn = NO;
 static BOOL g_floatLoginOK = NO;
@@ -1758,6 +1774,12 @@ static UIViewController *NDTopVC(void) {
         vc = ((UINavigationController *)vc).visibleViewController;
     }
     return vc;
+}
+
+static UIViewController *NDFloatHostVC(void) {
+    UIViewController *vc = g_floatWin.rootViewController;
+    if (vc) return vc;
+    return NDTopVC();
 }
 
 static NSString *NDShortUA(NSString *ua) {
@@ -1920,7 +1942,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self dismissViewControllerAnimated:NO completion:^{
         UIActivityViewController *ac = [[UIActivityViewController alloc]
             initWithActivityItems:@[r ?: @""] applicationActivities:nil];
-        UIViewController *top = NDTopVC();
+        UIViewController *top = NDFloatHostVC();
         if (top) [top presentViewController:ac animated:YES completion:nil];
     }];
 }
@@ -1930,7 +1952,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-05\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-06\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -1997,43 +2019,77 @@ static void NDShowReport(void) {
     }
 
     NDReportVC *rc = [[NDReportVC alloc] initWithReport:r];
-    UIViewController *top = NDTopVC();
-    if (top) [top presentViewController:rc animated:YES completion:nil];
+    UIViewController *host = NDFloatHostVC();
+    if (host) [host presentViewController:rc animated:YES completion:nil];
+}
+
+static UIWindowScene *NDActiveWindowScene(void) {
+    UIWindowScene *fallback = nil;
+    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+        if (![s isKindOfClass:UIWindowScene.class]) continue;
+        UIWindowScene *ws = (UIWindowScene *)s;
+        if (ws.activationState == UISceneActivationStateForegroundActive) return ws;
+        if (!fallback) fallback = ws;
+    }
+    return fallback;
+}
+
+static void NDEnsureFloatWindow(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ NDEnsureFloatWindow(); });
+        return;
+    }
+    UIWindowScene *scene = NDActiveWindowScene();
+    if (g_floatWin && g_floatBtn) {
+        if (scene && g_floatWin.windowScene != scene) g_floatWin.windowScene = scene;
+        g_floatWin.windowLevel = UIWindowLevelAlert + 1;
+        g_floatWin.hidden = NO;
+        return;
+    }
+    if (!scene) return;
+
+    NDFloatWindow *win = [[NDFloatWindow alloc] initWithWindowScene:scene];
+    win.frame = scene.coordinateSpace.bounds;
+    win.windowLevel = UIWindowLevelAlert + 1;
+    win.backgroundColor = UIColor.clearColor;
+    win.opaque = NO;
+    win.userInteractionEnabled = YES;
+
+    UIViewController *root = [[UIViewController alloc] init];
+    root.view.backgroundColor = UIColor.clearColor;
+    win.rootViewController = root;
+
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.frame = CGRectMake(8, 120, 56, 56);
+    b.layer.cornerRadius = 28;
+    b.layer.masksToBounds = YES;
+    b.backgroundColor = [UIColor colorWithRed:0.10 green:0.55 blue:0.95 alpha:0.85];
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    b.titleLabel.numberOfLines = 1;
+    [b setTitle:@"网解" forState:UIControlStateNormal];
+    [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [b addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
+        NDFloatTapped();
+    }] forControlEvents:UIControlEventTouchUpInside];
+    b.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
+    [root.view addSubview:b];
+
+    g_floatWin = win;
+    g_floatBtn = b;
+    win.hidden = NO;
+    NDFloatMaybeAlreadyLoggedIn();
 }
 
 static void NDSetupFloatButton(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
+            NDEnsureFloatWindow();
             if (g_floatBtn) return;
-            CGRect f = [UIScreen mainScreen].bounds;
-            UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-            b.frame = CGRectMake(8, 120, 56, 56);
-            b.layer.cornerRadius = 28;
-            b.layer.masksToBounds = YES;
-            b.backgroundColor = [UIColor colorWithRed:0.10 green:0.55 blue:0.95 alpha:0.85];
-            b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-            b.titleLabel.numberOfLines = 1;
-            [b setTitle:@"网解" forState:UIControlStateNormal];
-            [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-            [b addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
-                NDFloatTapped();
-            }] forControlEvents:UIControlEventTouchUpInside];
-            b.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
-            UIWindow *w = nil;
-            for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-                if ([scene isKindOfClass:UIWindowScene.class] && scene.activationState == UISceneActivationStateForegroundActive) {
-                    for (UIWindow *win in ((UIWindowScene *)scene).windows) {
-                        if (win.isKeyWindow) { w = win; break; }
-                    }
-                }
-            }
-            (void)f;
-            if (w) {
-                [w addSubview:b];
-                g_floatBtn = b;
-                NDFloatMaybeAlreadyLoggedIn();
-            }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                NDEnsureFloatWindow();
+            });
         });
     });
 }
@@ -2065,6 +2121,7 @@ static void nd_constructor(void) {
                                                           object:nil queue:NSOperationQueue.mainQueue
                                                       usingBlock:^(__unused NSNotification *note) {
             NDLoadConfig();
+            NDEnsureFloatWindow();
         }];
         NSLog(@"[NDSpoofer] loaded profile=%@ (%@) iOS %@",
               c.hwMachine, c.hwModel, c.systemVersion);
