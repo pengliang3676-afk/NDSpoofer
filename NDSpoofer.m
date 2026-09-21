@@ -1,7 +1,11 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-20
+//  版本：9.21-21
+//
+//  9.21-21：登录设备可以显示 iPhone7,2 这种 identifier，不是永远未知。
+//  UA 从 (iPhone; CPU iPhone OS …) 改成 (iPhone12,5; CPU iPhone OS …)，
+//  device_name 从 iPhone 改成 hw.machine。不注入 JS。
 //
 //  9.21-20：网解管理器 App 图标从红底黑苹果换成蓝底「网」字。不注入 JS。
 //
@@ -412,6 +416,14 @@ static NSString *NDRewriteUA(NSString *s, NDConfig *c) {
     out = [rxCPU stringByReplacingMatchesInString:out options:0 range:NSMakeRange(0, out.length)
                                     withTemplate:NDEscapedTemplate([NSString stringWithFormat:@"CPU iPhone OS %@ like", fakeUnder])];
 
+    // Mozilla 括号：Passport 登录设备认 iPhone7,2 这种 identifier，不认光秃的 (iPhone;
+    if (c.hwMachine.length) {
+        NSRegularExpression *rxIPhoneParen = [NSRegularExpression regularExpressionWithPattern:
+            @"\\(iPhone(?:\\d+,\\d+)?; CPU iPhone OS" options:0 error:&err];
+        out = [rxIPhoneParen stringByReplacingMatchesInString:out options:0 range:NSMakeRange(0, out.length)
+                                              withTemplate:NDEscapedTemplate([NSString stringWithFormat:@"(%@; CPU iPhone OS", c.hwMachine])];
+    }
+
     // (iPhone12,8; iOS 16.3)
     NSRegularExpression *rxMachineUA = [NSRegularExpression regularExpressionWithPattern:
         @"\\(iPhone\\d+,\\d+;\\s*iOS \\d+(?:\\.\\d+)*\\)" options:0 error:&err];
@@ -696,7 +708,7 @@ static NSDictionary *NDRewriteDict(NSDictionary *d, NDConfig *c, BOOL sapi) {
             if ([v isEqualToString:c.realMachine]) { m[k] = c.hwMachine; return; }
             if ([v isEqualToString:c.realOSVersion]) { m[k] = c.systemVersion; return; }
             if (sapi && [k isEqualToString:@"device_name"]) {
-                m[k] = @"iPhone";
+                m[k] = c.hwMachine.length ? c.hwMachine : @"iPhone";
             } else if (sapi && ([k isEqualToString:@"PhoneModel"] || [k isEqualToString:@"phoneModel"])) {
                 m[k] = c.hwMachine;
             } else if ([k isEqualToString:@"SystemVersion"] || [k isEqualToString:@"osVersion"] ||
@@ -903,7 +915,7 @@ static NSString *nd_hook_sapiDeviceModel(id self, SEL _cmd) {
 }
 static NSString *nd_hook_sapiDeviceName(id self, SEL _cmd) {
     NDConfig *c = NDCurrentConfig();
-    if (c.enabled && c.spoofBaiduSDK) return @"iPhone";
+    if (c.enabled && c.spoofBaiduSDK && c.hwMachine.length) return c.hwMachine;
     return nd_o_sapiDeviceName ? ((NSString *(*)(id, SEL))nd_o_sapiDeviceName)(self, _cmd) : @"iPhone";
 }
 static NSString *nd_hook_sapiDeviceType(id self, SEL _cmd) {
@@ -1180,7 +1192,7 @@ static NSDictionary *NDWapDeviceDict(void) {
     if (!c || !c.enabled || !c.spoofBaiduSDK || !c.hwMachine.length) return nil;
     NSMutableDictionary *m = [NSMutableDictionary dictionary];
     m[@"PhoneModel"] = c.hwMachine;
-    m[@"device_name"] = @"iPhone";
+    m[@"device_name"] = c.hwMachine;
     if (c.systemVersion.length) m[@"SystemVersion"] = c.systemVersion;
     return m;
 }
@@ -2278,7 +2290,9 @@ static void NDSeedPassCustom(NDConfig *c) {
         }
         // PASS_CUSTOM_UA_WK：不存在或仍含真机机型/系统时重写；Mobile/15E148 保持
         NSString *uaWk = [d stringForKey:@"PASS_CUSTOM_UA_WK"];
-        BOOL stale = !uaWk.length ||
+        BOOL hasMachineInParen = c.hwMachine.length &&
+            [uaWk containsString:[NSString stringWithFormat:@"(%@; CPU iPhone OS", c.hwMachine]];
+        BOOL stale = !uaWk.length || !hasMachineInParen ||
             (c.realMachine.length && ([uaWk containsString:c.realMachine] ||
                                       [uaWk containsString:NDMachineEncoded(c.realMachine)])) ||
             (realUnder.length && [uaWk containsString:[NSString stringWithFormat:@"OS %@ like", realUnder]]);
@@ -2288,8 +2302,8 @@ static void NDSeedPassCustom(NDConfig *c) {
             if (parts.count > 3) appVer = [[parts subarrayWithRange:NSMakeRange(0, 3)] componentsJoinedByString:@"."];
             NSString *sdkVer = c.passSdkVersion.length ? c.passSdkVersion : @"9.8.12.20";
             NSString *ua = [NSString stringWithFormat:
-                @"Mozilla/5.0 (iPhone; CPU iPhone OS %@ like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Sapi_%@/%@_%@_%@_Sapi",
-                fakeUnder, sdkVer, appVer, NDMachineEncoded(c.hwMachine), c.systemVersion];
+                @"Mozilla/5.0 (%@; CPU iPhone OS %@ like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Sapi_%@/%@_%@_%@_Sapi",
+                c.hwMachine, fakeUnder, sdkVer, appVer, NDMachineEncoded(c.hwMachine), c.systemVersion];
             [d setObject:ua forKey:@"PASS_CUSTOM_UA_WK"];
         }
         [d synchronize];
@@ -2603,7 +2617,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-20\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-21\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -2709,7 +2723,7 @@ static void NDShowReport(void) {
     [r appendString:@"看最近内容里的 has_di。登录 POST 有 di 仍未知 → 看下面明文字段是否自洽。\n"];
     [r appendString:@"登录后看「登录设备」最新一条。\n"];
 
-    [r appendString:@"\n—— 加密前 di 明文（9.21-20）——\n"];
+    [r appendString:@"\n—— 加密前 di 明文（9.21-21）——\n"];
     [r appendFormat:@"采样：%d  其中有SOH：%d  字段数：%d\n", g_plainN, g_plainSohN, g_plainCnt];
     [r appendFormat:@"[3] PhoneModel：%@\n", g_plainPM ?: @"(无)"];
     [r appendFormat:@"[4] SystemVersion：%@\n", g_plainVer ?: @"(无)"];
