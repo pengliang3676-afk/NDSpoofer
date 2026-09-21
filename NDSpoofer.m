@@ -1,7 +1,11 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-21
+//  版本：9.21-22
+//
+//  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
+//  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
+//  加载登录页时强制 setCustomUserAgent。不注入 JS。
 //
 //  9.21-21：登录设备可以显示 iPhone7,2 这种 identifier，不是永远未知。
 //  UA 从 (iPhone; CPU iPhone OS …) 改成 (iPhone12,5; CPU iPhone OS …)，
@@ -1888,6 +1892,37 @@ static SEL g_nduSelDt2 = NULL;
 static SEL g_nduSelConn = NULL;
 static SEL g_nduSelUdSet = NULL;
 
+static NSString *NDBuildPassUA(void) {
+    NDConfig *c = NDCurrentConfig();
+    if (!c || !c.hwMachine.length || !c.systemVersion.length) return nil;
+    NSString *fakeUnder = [c.systemVersion stringByReplacingOccurrencesOfString:@"." withString:@"_"];
+    NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"";
+    NSArray<NSString *> *parts = [appVer componentsSeparatedByString:@"."];
+    if (parts.count > 3) appVer = [[parts subarrayWithRange:NSMakeRange(0, 3)] componentsJoinedByString:@"."];
+    NSString *sdkVer = c.passSdkVersion.length ? c.passSdkVersion : @"9.8.12.20";
+    return [NSString stringWithFormat:
+        @"Mozilla/5.0 (%@; CPU iPhone OS %@ like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Sapi_%@/%@_%@_%@_Sapi",
+        c.hwMachine, fakeUnder, sdkVer, appVer, NDMachineEncoded(c.hwMachine), c.systemVersion];
+}
+
+static int g_wkForceUaN = 0;
+
+static void NDForceWKCustomUA(id wv) {
+    if (!wv) return;
+    NSString *ua = NDBuildPassUA();
+    if (!ua.length) return;
+    SEL setUA = @selector(setCustomUserAgent:);
+    if (![wv respondsToSelector:setUA]) return;
+    NSString *cur = nil;
+    if ([wv respondsToSelector:@selector(customUserAgent)]) {
+        id v = ((id (*)(id, SEL))objc_msgSend)(wv, @selector(customUserAgent));
+        if ([v isKindOfClass:NSString.class]) cur = v;
+    }
+    if ([cur isEqualToString:ua]) return;
+    ((void (*)(id, SEL, id))objc_msgSend)(wv, setUA, ua);
+    g_wkForceUaN++;
+}
+
 // 1) -[WKWebView setCustomUserAgent:]：改写入参再下发
 static void ndu_tr_wkSetUA(id self, SEL _cmd, id ua) {
     id out = ua;
@@ -1903,6 +1938,8 @@ static void ndu_tr_wkSetUA(id self, SEL _cmd, id ua) {
 static id ndu_tr_wkLoad(id self, SEL _cmd, id req) {
     NSURLRequest *r = [req isKindOfClass:NSURLRequest.class] ? (NSURLRequest *)req : nil;
     NDConfig *c = NDCurrentConfig();
+    if (c && c.enabled && c.spoofBaiduSDK)
+        NDForceWKCustomUA(self);
     if (r && c && c.enabled && c.spoofBaiduSDK)
         r = NDRequestByAddingWapDevice(r, @"wkLoad");
     if (!r || !c || !c.enabled || !c.spoofBaiduSDK || !NDURLNeedsDVIF(r.URL) || NDRequestHasDVIF(r)) {
@@ -1929,6 +1966,8 @@ static id ndu_tr_wkLoad(id self, SEL _cmd, id req) {
 static id ndu_tr_passLoad(id self, SEL _cmd, id req) {
     NSURLRequest *r = [req isKindOfClass:NSURLRequest.class] ? (NSURLRequest *)req : nil;
     NDConfig *c = NDCurrentConfig();
+    if (c && c.enabled && c.spoofBaiduSDK)
+        NDForceWKCustomUA(NDRealWebView(self) ?: self);
     if (!r || !c || !c.enabled || !c.spoofBaiduSDK || !NDURLNeedsDVIF(r.URL)) {
         NDNotePassReq(@"load", r);
         return ((id(*)(id, SEL, id))objc_msgSend)(self, g_nduSelPassLoad, req);
@@ -1954,6 +1993,7 @@ static void ndu_tr_passInitWK(id self, SEL _cmd) {
     ((void(*)(id, SEL))objc_msgSend)(self, g_nduSelPassInitWK);
     NDConfig *c = NDCurrentConfig();
     if (!c || !c.enabled || !c.spoofBaiduSDK) return;
+    NDForceWKCustomUA(NDRealWebView(self));
     NDEnsureDeviceCookie();
     NDSyncDVIFToStore(NDCookieStoreFromWebView(NDRealWebView(self)), nil);
 }
@@ -2280,7 +2320,6 @@ static void NDSeedPassCustom(NDConfig *c) {
     if (!c.enabled || !c.seedPassCustom) return;
     @try {
         NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-        NSString *fakeUnder = [c.systemVersion stringByReplacingOccurrencesOfString:@"." withString:@"_"];
         NSString *realUnder = [c.realOSVersion stringByReplacingOccurrencesOfString:@"." withString:@"_"];
 
         // PASS_CUSTOM_SYS_VER：不存在或仍是真机值时写入
@@ -2297,14 +2336,8 @@ static void NDSeedPassCustom(NDConfig *c) {
                                       [uaWk containsString:NDMachineEncoded(c.realMachine)])) ||
             (realUnder.length && [uaWk containsString:[NSString stringWithFormat:@"OS %@ like", realUnder]]);
         if (stale) {
-            NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"";
-            NSArray<NSString *> *parts = [appVer componentsSeparatedByString:@"."];
-            if (parts.count > 3) appVer = [[parts subarrayWithRange:NSMakeRange(0, 3)] componentsJoinedByString:@"."];
-            NSString *sdkVer = c.passSdkVersion.length ? c.passSdkVersion : @"9.8.12.20";
-            NSString *ua = [NSString stringWithFormat:
-                @"Mozilla/5.0 (%@; CPU iPhone OS %@ like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Sapi_%@/%@_%@_%@_Sapi",
-                c.hwMachine, fakeUnder, sdkVer, appVer, NDMachineEncoded(c.hwMachine), c.systemVersion];
-            [d setObject:ua forKey:@"PASS_CUSTOM_UA_WK"];
+            NSString *ua = NDBuildPassUA();
+            if (ua.length) [d setObject:ua forKey:@"PASS_CUSTOM_UA_WK"];
         }
         [d synchronize];
     } @catch (__unused NSException *e) {}
@@ -2617,7 +2650,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-21\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-22\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -2635,6 +2668,7 @@ static void NDShowReport(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     [r appendFormat:@"\nPASS_CUSTOM_SYS_VER：%@\n", [d stringForKey:@"PASS_CUSTOM_SYS_VER"] ?: @"(未设置)"];
     [r appendFormat:@"PASS_CUSTOM_UA_WK：%@\n", [d stringForKey:@"PASS_CUSTOM_UA_WK"] ?: @"(未设置)"];
+    [r appendFormat:@"登录WK强制UA：%d 次\n", g_wkForceUaN];
 
     // 9.20-05 通道自检：直接调用会经过 NSProcessInfo hook；读 NSUserDefaults 看到的是出口收口后的实际值。
     [r appendString:@"\n—— 9.20-05 通道自检 ——\n"];
@@ -2723,7 +2757,7 @@ static void NDShowReport(void) {
     [r appendString:@"看最近内容里的 has_di。登录 POST 有 di 仍未知 → 看下面明文字段是否自洽。\n"];
     [r appendString:@"登录后看「登录设备」最新一条。\n"];
 
-    [r appendString:@"\n—— 加密前 di 明文（9.21-21）——\n"];
+    [r appendString:@"\n—— 加密前 di 明文（9.21-22）——\n"];
     [r appendFormat:@"采样：%d  其中有SOH：%d  字段数：%d\n", g_plainN, g_plainSohN, g_plainCnt];
     [r appendFormat:@"[3] PhoneModel：%@\n", g_plainPM ?: @"(无)"];
     [r appendFormat:@"[4] SystemVersion：%@\n", g_plainVer ?: @"(无)"];
