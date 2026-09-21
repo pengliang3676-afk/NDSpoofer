@@ -1,7 +1,13 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-11
+//  版本：9.21-12
+//
+//  9.21-12：11 实测短信仍是网页提交，smsWap=0；写入 14 次全是登录后的
+//  passport getuinfo / batch/diff，不是登录 POST。网页 XHR 不走 NSURLSession。
+//  改为把 PhoneModel / device_name / SystemVersion 写进 .baidu.com Cookie
+//  （系统仓库 + 登录 WKHTTPCookieStore），网页提交会自动带 Cookie。HTTP 只改登录类
+//  路径，不再污染 getuinfo。不注入 JS。
 //
 //  9.21-11：WAP 号登录次数打满，改走另一号短信登录。原生短信不打开 WAP 页，09/10 的
 //  loadRequest 查询串写不上。把 PhoneModel / device_name / SystemVersion 写进
@@ -1042,6 +1048,8 @@ static void NDNoteStoreDVIF(id store);
 static NSString *NDShortPassURL(NSURL *u);
 
 static int g_wapParamN = 0;
+static int g_wapViaWk = 0, g_wapViaHttp = 0, g_wapViaSms = 0;
+static int g_wapViaBase = 0, g_wapViaCookie = 0, g_wapViaExtra = 0;
 static NSString *g_wapParamVia = nil;
 static NSString *g_wapParamLast = nil;
 
@@ -1059,6 +1067,19 @@ static void NDNoteWapParam(NSString *via, NSString *detail) {
     g_wapParamN++;
     g_wapParamVia = [via copy];
     if (detail.length) g_wapParamLast = [detail copy];
+    if ([via isEqualToString:@"wkLoad"] || [via isEqualToString:@"passLoad"] ||
+        [via isEqualToString:@"sapiLoad"])
+        g_wapViaWk++;
+    else if ([via isEqualToString:@"http"])
+        g_wapViaHttp++;
+    else if ([via hasPrefix:@"sms"])
+        g_wapViaSms++;
+    else if ([via isEqualToString:@"addBaseParams"] || [via isEqualToString:@"smsBase"])
+        g_wapViaBase++;
+    else if ([via isEqualToString:@"cookie"])
+        g_wapViaCookie++;
+    else
+        g_wapViaExtra++;
 }
 
 static NSDictionary *NDMergeWapNamed(id extra, NSString *via) {
@@ -1079,12 +1100,70 @@ static NSDictionary *NDMergeWapDict(id extra) {
     return NDMergeWapNamed(extra, @"extraParams");
 }
 
+static BOOL NDURLIsPassportHost(NSURL *u) {
+    NSString *h = (u.host ?: @"").lowercaseString;
+    return [h containsString:@"wappass"] || [h containsString:@"passport"] ||
+           [h isEqualToString:@"pass.baidu.com"] || [h hasSuffix:@".pass.baidu.com"];
+}
+
+static BOOL NDURLIsLoginSubmit(NSURL *u) {
+    if (!NDURLIsPassportHost(u)) return NO;
+    NSString *p = (u.path ?: @"").lowercaseString;
+    return [p containsString:@"login"] || [p containsString:@"sms"] ||
+           [p containsString:@"/wap"] || [p containsString:@"/cap"] ||
+           [p containsString:@"getdpass"] || [p containsString:@"/wp/api"] ||
+           [p containsString:@"sendsms"];
+}
+
+static NSArray<NSHTTPCookie *> *NDDeviceFieldCookies(void) {
+    NSDictionary *add = NDWapDeviceDict();
+    if (!add) return @[];
+    NSMutableArray *out = [NSMutableArray array];
+    [add enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
+        if (![k isKindOfClass:NSString.class] || ![v isKindOfClass:NSString.class] || !v.length)
+            return;
+        for (NSString *dom in @[ @".baidu.com", @"baidu.com" ]) {
+            NSHTTPCookie *c = [NSHTTPCookie cookieWithProperties:@{
+                NSHTTPCookieName: k,
+                NSHTTPCookieValue: v,
+                NSHTTPCookieDomain: dom,
+                NSHTTPCookiePath: @"/",
+                NSHTTPCookieSecure: @"TRUE",
+            }];
+            if (c) [out addObject:c];
+        }
+    }];
+    return out;
+}
+
+static void NDEnsureDeviceFieldCookies(void) {
+    NSArray *cks = NDDeviceFieldCookies();
+    if (!cks.count) return;
+    NSHTTPCookieStorage *st = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+    for (NSHTTPCookie *c in cks) {
+        @try { [st setCookie:c]; } @catch (__unused NSException *e) {}
+    }
+    static int noted = 0;
+    if (!noted) {
+        noted = 1;
+        NSDictionary *add = NDWapDeviceDict();
+        NDNoteWapParam(@"cookie", [NSString stringWithFormat:@"PhoneModel=%@", add[@"PhoneModel"] ?: @"-"]);
+    }
+}
+
+static NSArray<NSHTTPCookie *> *NDCookiesForPassWebView(void) {
+    NSMutableArray *a = [NSMutableArray array];
+    NSArray *dv = NDDVIFCookiesFromShared();
+    if (dv.count) [a addObjectsFromArray:dv];
+    NSArray *dev = NDDeviceFieldCookies();
+    if (dev.count) [a addObjectsFromArray:dev];
+    return a;
+}
+
 static NSURL *NDURLByAddingWapDevice(NSURL *u, NSString *via) {
     if (![u isKindOfClass:NSURL.class] || !u.host.length) return u;
-    NSString *h = u.host.lowercaseString;
-    BOOL wap = [h containsString:@"wappass"] || [h containsString:@"passport"] ||
-               [h isEqualToString:@"pass.baidu.com"] || [h hasSuffix:@".pass.baidu.com"];
-    if (!wap) return u;
+    if (!NDURLIsPassportHost(u)) return u;
+    if ([via isEqualToString:@"http"] && !NDURLIsLoginSubmit(u)) return u;
     NSDictionary *add = NDWapDeviceDict();
     if (!add) return u;
     NSString *abs = u.absoluteString ?: @"";
@@ -1124,7 +1203,8 @@ static void NDSyncDVIFToStore(id store, void (^done)(void)) {
         else dispatch_async(dispatch_get_main_queue(), done);
     };
     if (!store) { finish(); return; }
-    NSArray *cks = NDDVIFCookiesFromShared();
+    NDEnsureDeviceFieldCookies();
+    NSArray *cks = NDCookiesForPassWebView();
     SEL setSel = @selector(setCookie:completionHandler:);
     if (!cks.count || ![store respondsToSelector:setSel]) {
         NDNoteStoreDVIF(store);
@@ -1146,7 +1226,7 @@ static void NDSyncDVIFToStore(id store, void (^done)(void)) {
 
 static NSURLRequest *NDRequestAppendingDVIFCookie(NSURLRequest *req) {
     if (![req isKindOfClass:NSURLRequest.class]) return req;
-    NSArray *cks = NDDVIFCookiesFromShared();
+    NSArray *cks = NDCookiesForPassWebView();
     if (!cks.count) return req;
     NSString *old = nil;
     for (NSString *k in req.allHTTPHeaderFields) {
@@ -1195,6 +1275,7 @@ static void NDEnsureDeviceCookie(void) {
     SEL setDvif = NSSelectorFromString(@"setDeviceInfoToCookie");
     if (cm && [cm respondsToSelector:setDvif])
         ((void (*)(id, SEL))objc_msgSend)(cm, setDvif);
+    NDEnsureDeviceFieldCookies();
 }
 
 static BOOL NDURLNeedsDVIF(NSURL *u) {
@@ -1737,7 +1818,7 @@ static void ndu_tr_sapiLoadCk(id self, SEL _cmd, id url, id cookies) {
     id outUrl = url;
     if (c && c.enabled && c.spoofBaiduSDK) {
         NDEnsureDeviceCookie();
-        NSArray *dv = NDDVIFCookiesFromShared();
+        NSArray *dv = NDCookiesForPassWebView();
         if (dv.count) {
             NSMutableArray *m = [NSMutableArray array];
             if ([cookies isKindOfClass:NSArray.class]) [m addObjectsFromArray:cookies];
@@ -2368,7 +2449,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-11\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-12\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -2462,13 +2543,16 @@ static void NDShowReport(void) {
     [r appendString:@"读法：di_keys 不含 PhoneModel → H5 登录根本不要机型。\n"];
     [r appendString:@"keys 有 PhoneModel 且回包有值，登录设备仍未知 → Passport 不用这份机型。\n"];
 
-    [r appendString:@"\n—— 登录参数（9.21-11，短信优先）——\n"];
+    [r appendString:@"\n—— 登录参数（9.21-12）——\n"];
     [r appendFormat:@"写入次数：%d\n", g_wapParamN];
+    [r appendFormat:@"wkLoad/passLoad：%d  http登录路径：%d  原生短信：%d\n",
+        g_wapViaWk, g_wapViaHttp, g_wapViaSms];
+    [r appendFormat:@"addBase/smsBase：%d  Cookie：%d  其它：%d\n",
+        g_wapViaBase, g_wapViaCookie, g_wapViaExtra];
     [r appendFormat:@"最近出口：%@\n", g_wapParamVia ?: @"(还没写到短信/WAP 参数)"];
     [r appendFormat:@"最近内容：%@\n", g_wapParamLast ?: @"-"];
     [r appendFormat:@"最近 Passport URL：%@\n", g_h5LastURL ?: @"(无)"];
-    [r appendString:@"短信登录看出口是不是 smsWap / smsLogin / smsMobile / addBaseParams / smsBase。\n"];
-    [r appendString:@"若全无、只有 wkLoad，说明这次仍是网页短信，不是原生 smsWap。\n"];
+    [r appendString:@"网页短信看 Cookie 是否>0。原生短信看「原生短信」是否>0。\n"];
     [r appendString:@"登录后看「登录设备」最新一条。\n"];
 
     NDReportVC *rc = [[NDReportVC alloc] initWithReport:r];
