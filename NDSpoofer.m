@@ -1,7 +1,11 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-10
+//  版本：9.21-11
+//
+//  9.21-11：WAP 号登录次数打满，改走另一号短信登录。原生短信不打开 WAP 页，09/10 的
+//  loadRequest 查询串写不上。把 PhoneModel / device_name / SystemVersion 写进
+//  smsWap / smsLogin / loginWithMobile 的 extraParams 和 baseParamsForSMSLogin。不注入 JS。
 //
 //  9.21-10：09 写入次数=0。原因是 WKWebView loadRequest 在 Cookie 已有 DVIF 时直接原样放过，
 //  PhoneModel 没写进地址。改为无论有没有 DVIF 都写查询串；同一套字段再补到 NSURLSession
@@ -672,8 +676,14 @@ static IMP nd_o_loadLoginType = NULL;
 static IMP nd_o_loadLoginCfg = NULL;
 static IMP nd_o_addBaseQS = NULL;
 static IMP nd_o_addBaseParams = NULL;
+static IMP nd_o_smsWap = NULL;
+static IMP nd_o_smsSlim = NULL;
+static IMP nd_o_smsLogin = NULL;
+static IMP nd_o_smsMobile = NULL;
+static IMP nd_o_smsBase = NULL;
 
 static NSDictionary *NDMergeWapDict(id extra);
+static NSDictionary *NDMergeWapNamed(id extra, NSString *via);
 static NSDictionary *NDWapDeviceDict(void);
 static void NDNoteWapParam(NSString *via, NSString *detail);
 
@@ -954,11 +964,43 @@ static void nd_hook_addBaseParams(id self, SEL _cmd, id params, id iface) {
                            [NSString stringWithFormat:@"iface=%@ PhoneModel=%@",
                             [iface isKindOfClass:NSString.class] ? iface : @"-", add[@"PhoneModel"]]);
         } else if ([params isKindOfClass:NSDictionary.class] || params == nil) {
-            params = NDMergeWapDict(params);
+            params = NDMergeWapNamed(params, @"addBaseParams");
         }
     }
     if (nd_o_addBaseParams)
         ((void (*)(id, SEL, id, id))nd_o_addBaseParams)(self, _cmd, params, iface);
+}
+
+static void nd_hook_smsWap(id self, SEL _cmd, id cc, id phone, id code, id enc, id extra,
+                           id success, id verify, id failure) {
+    id merged = NDMergeWapNamed(extra, @"smsWap");
+    if (nd_o_smsWap)
+        ((void (*)(id, SEL, id, id, id, id, id, id, id, id))nd_o_smsWap)
+            (self, _cmd, cc, phone, code, enc, merged, success, verify, failure);
+}
+static void nd_hook_smsSlim(id self, SEL _cmd, id cc, id phone, id code, id enc, id extra,
+                            id success, id verify, id failure) {
+    id merged = NDMergeWapNamed(extra, @"smsSlim");
+    if (nd_o_smsSlim)
+        ((void (*)(id, SEL, id, id, id, id, id, id, id, id))nd_o_smsSlim)
+            (self, _cmd, cc, phone, code, enc, merged, success, verify, failure);
+}
+static void nd_hook_smsLogin(id self, SEL _cmd, id cc, id phone, id code, id enc, id extra,
+                             id success, id verify, id failure) {
+    id merged = NDMergeWapNamed(extra, @"smsLogin");
+    if (nd_o_smsLogin)
+        ((void (*)(id, SEL, id, id, id, id, id, id, id, id))nd_o_smsLogin)
+            (self, _cmd, cc, phone, code, enc, merged, success, verify, failure);
+}
+static void nd_hook_smsMobile(id self, SEL _cmd, id mobile, id dpass, id extra, id success, id failure) {
+    id merged = NDMergeWapNamed(extra, @"smsMobile");
+    if (nd_o_smsMobile)
+        ((void (*)(id, SEL, id, id, id, id, id))nd_o_smsMobile)
+            (self, _cmd, mobile, dpass, merged, success, failure);
+}
+static id nd_hook_smsBase(id self, SEL _cmd, id iface) {
+    id orig = nd_o_smsBase ? ((id (*)(id, SEL, id))nd_o_smsBase)(self, _cmd, iface) : nil;
+    return NDMergeWapNamed(orig, @"smsBase");
 }
 
 static int g_ndInSetCookie = 0;
@@ -1019,7 +1061,7 @@ static void NDNoteWapParam(NSString *via, NSString *detail) {
     if (detail.length) g_wapParamLast = [detail copy];
 }
 
-static NSDictionary *NDMergeWapDict(id extra) {
+static NSDictionary *NDMergeWapNamed(id extra, NSString *via) {
     NSDictionary *add = NDWapDeviceDict();
     if (!add) return extra;
     NSMutableDictionary *m = [NSMutableDictionary dictionary];
@@ -1028,8 +1070,13 @@ static NSDictionary *NDMergeWapDict(id extra) {
         if (![m[k] isKindOfClass:NSString.class] || ![((NSString *)m[k]) length])
             m[k] = v;
     }];
-    NDNoteWapParam(@"extraParams", [NSString stringWithFormat:@"PhoneModel=%@", add[@"PhoneModel"]]);
+    NDNoteWapParam(via.length ? via : @"extraParams",
+                   [NSString stringWithFormat:@"PhoneModel=%@", add[@"PhoneModel"]]);
     return m;
+}
+
+static NSDictionary *NDMergeWapDict(id extra) {
+    return NDMergeWapNamed(extra, @"extraParams");
 }
 
 static NSURL *NDURLByAddingWapDevice(NSURL *u, NSString *via) {
@@ -1459,6 +1506,21 @@ static void NDInstallAll(void) {
                  '@', 2, "@@", (IMP)nd_hook_addBaseQS, &nd_o_addBaseQS);
     NDInstallOne(@"SAPILoginManager", NSSelectorFromString(@"addBaseParamsWith:interface:"), NO,
                  'v', 2, "@@", (IMP)nd_hook_addBaseParams, &nd_o_addBaseParams);
+    NDInstallOne(@"SAPILoginService",
+                 NSSelectorFromString(@"smsWapLoginWithCountryCode:phoneNumber:smsCode:encryptedId:extraParams:success:verify:failure:"),
+                 NO, 'v', 8, "@@@@@???", (IMP)nd_hook_smsWap, &nd_o_smsWap);
+    NDInstallOne(@"SAPILoginService",
+                 NSSelectorFromString(@"smsWapLoginWithCountryCodeSlim:phoneNumber:smsCode:encryptedId:extraParams:success:verify:failure:"),
+                 NO, 'v', 8, "@@@@@???", (IMP)nd_hook_smsSlim, &nd_o_smsSlim);
+    NDInstallOne(@"SAPILoginService",
+                 NSSelectorFromString(@"smsLoginWithCountryCode:phoneNumber:smsCode:encryptedId:extraParams:success:verify:failure:"),
+                 NO, 'v', 8, "@@@@@???", (IMP)nd_hook_smsLogin, &nd_o_smsLogin);
+    NDInstallOne(@"SAPILoginService",
+                 NSSelectorFromString(@"loginWithMobile:dpass:extraParams:success:failure:"),
+                 NO, 'v', 5, "@@@??", (IMP)nd_hook_smsMobile, &nd_o_smsMobile);
+    NDInstallOne(@"SAPILoginService",
+                 NSSelectorFromString(@"baseParamsForSMSLoginWithInterface:"),
+                 NO, '@', 1, "@", (IMP)nd_hook_smsBase, &nd_o_smsBase);
 
     // BDPUserAgent 实例方法
     NDInstallOne(@"BDPUserAgent", NSSelectorFromString(@"useagent_getDeviceInfo"), NO, '@', 0, "",
@@ -2306,7 +2368,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-10\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-11\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -2400,13 +2462,14 @@ static void NDShowReport(void) {
     [r appendString:@"读法：di_keys 不含 PhoneModel → H5 登录根本不要机型。\n"];
     [r appendString:@"keys 有 PhoneModel 且回包有值，登录设备仍未知 → Passport 不用这份机型。\n"];
 
-    [r appendString:@"\n—— WAP 登录参数（9.21-10）——\n"];
+    [r appendString:@"\n—— 登录参数（9.21-11，短信优先）——\n"];
     [r appendFormat:@"写入次数：%d\n", g_wapParamN];
-    [r appendFormat:@"最近出口：%@\n", g_wapParamVia ?: @"(还没写到登录 URL)"];
+    [r appendFormat:@"最近出口：%@\n", g_wapParamVia ?: @"(还没写到短信/WAP 参数)"];
     [r appendFormat:@"最近内容：%@\n", g_wapParamLast ?: @"-"];
     [r appendFormat:@"最近 Passport URL：%@\n", g_h5LastURL ?: @"(无)"];
-    [r appendString:@"09 写入=0 是因为 Cookie 已有 DVIF 时 loadRequest 被跳过。10 不再跳过。\n"];
-    [r appendString:@"登录后看「登录设备」最新一条。仍未知再说。\n"];
+    [r appendString:@"短信登录看出口是不是 smsWap / smsLogin / smsMobile / addBaseParams / smsBase。\n"];
+    [r appendString:@"若全无、只有 wkLoad，说明这次仍是网页短信，不是原生 smsWap。\n"];
+    [r appendString:@"登录后看「登录设备」最新一条。\n"];
 
     NDReportVC *rc = [[NDReportVC alloc] initWithReport:r];
     UIViewController *host = NDFloatHostVC();
