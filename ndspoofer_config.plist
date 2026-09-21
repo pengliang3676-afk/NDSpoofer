@@ -18,6 +18,8 @@
 	<false/>
 	<key>spoofStorage</key>
 	<false/>
+	<key>spoofScreen</key>
+	<false/>
 	<key>seedPassCustom</key>
 	<false/>
 	<key>hwMachine</key>

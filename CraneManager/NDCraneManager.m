@@ -1,10 +1,12 @@
 //
 //  NDCraneManager.m  —  网盘解（卍解）：为百度网盘的 Crane 容器逐容器写入 NDSpoofer 配置
 //
-//  版本：9.20-05
+//  版本：9.21-01
 //
 //  用法：多选容器 → 一键随机网盘身份（每个容器一套独立机型/系统/IDFV）。
-//  机型池只包含与真机同屏（375x667 @2x）的 iPhone 8 / iPhone SE3，避免机型与屏幕矛盾。
+//  9.21-01：机型池扩到 36 套（iPhone 8 ~ iPhone 17 系列，含异屏机型），每套带真实
+//  逻辑/物理分辨率与 scale；dylib 仅 hook 百度统计 EBAppLogDeviceHelper 的屏幕上报出口，
+//  绝不触碰 UIScreen，页面布局仍用真机尺寸，不卡死、不影响触摸。
 //
 
 #import <Foundation/Foundation.h>
@@ -44,14 +46,18 @@ typedef NS_ENUM(NSInteger, NDCraneContainerPathType) {
 
 static NSDictionary *NDDevice(NSString *name, NSString *machine, NSString *model,
                               NSString *marketing, NSString *cpuBrand,
-                              NSInteger memory, NSArray<NSNumber *> *disks,
+                              NSInteger width, NSInteger height,
+                              NSInteger nativeWidth, NSInteger nativeHeight,
+                              NSInteger scale, NSInteger memory,
+                              NSArray<NSNumber *> *disks,
                               NSString *minimumOS, NSInteger maximumMajor) {
     return @{
         @"name": name, @"machine": machine, @"model": model,
         @"marketing": marketing, @"cpuBrand": cpuBrand,
-        // 两机均为 375x667 @2x / 750x1334，与 SE2 真机完全一致
-        @"width": @375, @"height": @667,
-        @"nativeWidth": @750, @"nativeHeight": @1334, @"scale": @2,
+        // 屏幕参数随机型：width/height 为逻辑点，nativeWidth/Height 为物理像素，scale 为缩放倍数。
+        // 仅用于管理器展示及 dylib 对百度统计上报值的改写；dylib 不 hook UIScreen。
+        @"width": @(width), @"height": @(height),
+        @"nativeWidth": @(nativeWidth), @"nativeHeight": @(nativeHeight), @"scale": @(scale),
         @"memory": @(memory), @"disks": disks,
         @"minimumOS": minimumOS, @"maximumMajor": @(maximumMajor)
     };
@@ -62,10 +68,78 @@ static NSArray<NSDictionary *> *NDDeviceProfiles(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         profiles = @[
-            NDDevice(@"iPhone 8", @"iPhone10,1", @"D20AP", @"iPhone8",
-                     @"Apple A11 Bionic", 2048, @[@64], @"15.0", 16),
-            NDDevice(@"iPhone SE (3rd generation)", @"iPhone14,6", @"D49AP", @"iPhoneSE3",
-                     @"Apple A15 Bionic", 4096, @[@64, @128, @256], @"15.4", 18),
+            NDDevice(@"iPhone 8", @"iPhone10,1", @"D20AP", @"iPhone8", @"Apple A11 Bionic",
+                     375, 667, 750, 1334, 2, 2048, @[@64,@256], @"15.0", 16),
+            NDDevice(@"iPhone 8 Plus", @"iPhone10,2", @"D21AP", @"iPhone8Plus", @"Apple A11 Bionic",
+                     414, 736, 1080, 1920, 3, 3072, @[@64,@256], @"15.0", 16),
+            NDDevice(@"iPhone X", @"iPhone10,3", @"D22AP", @"iPhoneX", @"Apple A11 Bionic",
+                     375, 812, 1125, 2436, 3, 3072, @[@64,@256], @"15.0", 16),
+            NDDevice(@"iPhone XR", @"iPhone11,8", @"N841AP", @"iPhoneXR", @"Apple A12 Bionic",
+                     414, 896, 828, 1792, 2, 3072, @[@64,@128,@256], @"15.0", 18),
+            NDDevice(@"iPhone XS", @"iPhone11,2", @"D321AP", @"iPhoneXS", @"Apple A12 Bionic",
+                     375, 812, 1125, 2436, 3, 4096, @[@64,@256,@512], @"15.0", 18),
+            NDDevice(@"iPhone XS Max", @"iPhone11,6", @"D331pAP", @"iPhoneXSMax", @"Apple A12 Bionic",
+                     414, 896, 1242, 2688, 3, 4096, @[@64,@256,@512], @"15.0", 18),
+            NDDevice(@"iPhone 11", @"iPhone12,1", @"N104AP", @"iPhone11", @"Apple A13 Bionic",
+                     414, 896, 828, 1792, 2, 4096, @[@64,@128,@256], @"15.0", 26),
+            NDDevice(@"iPhone 11 Pro", @"iPhone12,3", @"D421AP", @"iPhone11Pro", @"Apple A13 Bionic",
+                     375, 812, 1125, 2436, 3, 4096, @[@64,@256,@512], @"15.0", 26),
+            NDDevice(@"iPhone 11 Pro Max", @"iPhone12,5", @"D431AP", @"iPhone11ProMax", @"Apple A13 Bionic",
+                     414, 896, 1242, 2688, 3, 4096, @[@64,@256,@512], @"15.0", 26),
+            NDDevice(@"iPhone 12 mini", @"iPhone13,1", @"D52gAP", @"iPhone12mini", @"Apple A14 Bionic",
+                     375, 812, 1080, 2340, 3, 4096, @[@64,@128,@256], @"15.0", 26),
+            NDDevice(@"iPhone 12", @"iPhone13,2", @"D53gAP", @"iPhone12", @"Apple A14 Bionic",
+                     390, 844, 1170, 2532, 3, 4096, @[@64,@128,@256], @"15.0", 26),
+            NDDevice(@"iPhone 12 Pro", @"iPhone13,3", @"D53pAP", @"iPhone12Pro", @"Apple A14 Bionic",
+                     390, 844, 1170, 2532, 3, 6144, @[@128,@256,@512], @"15.0", 26),
+            NDDevice(@"iPhone 12 Pro Max", @"iPhone13,4", @"D54pAP", @"iPhone12ProMax", @"Apple A14 Bionic",
+                     428, 926, 1284, 2778, 3, 6144, @[@128,@256,@512], @"15.0", 26),
+            NDDevice(@"iPhone 13 mini", @"iPhone14,4", @"D16AP", @"iPhone13mini", @"Apple A15 Bionic",
+                     375, 812, 1080, 2340, 3, 4096, @[@128,@256,@512], @"15.0", 26),
+            NDDevice(@"iPhone 13", @"iPhone14,5", @"D17AP", @"iPhone13", @"Apple A15 Bionic",
+                     390, 844, 1170, 2532, 3, 4096, @[@128,@256,@512], @"15.0", 26),
+            NDDevice(@"iPhone 13 Pro", @"iPhone14,2", @"D63AP", @"iPhone13Pro", @"Apple A15 Bionic",
+                     390, 844, 1170, 2532, 3, 6144, @[@128,@256,@512,@1024], @"15.0", 26),
+            NDDevice(@"iPhone 13 Pro Max", @"iPhone14,3", @"D64AP", @"iPhone13ProMax", @"Apple A15 Bionic",
+                     428, 926, 1284, 2778, 3, 6144, @[@128,@256,@512,@1024], @"15.0", 26),
+            NDDevice(@"iPhone SE (3rd generation)", @"iPhone14,6", @"D49AP", @"iPhoneSE3", @"Apple A15 Bionic",
+                     375, 667, 750, 1334, 2, 4096, @[@64,@128,@256], @"15.4", 26),
+            NDDevice(@"iPhone 14", @"iPhone14,7", @"D27AP", @"iPhone14", @"Apple A15 Bionic",
+                     390, 844, 1170, 2532, 3, 6144, @[@128,@256,@512], @"16.0", 26),
+            NDDevice(@"iPhone 14 Pro", @"iPhone15,2", @"D73AP", @"iPhone14Pro", @"Apple A16 Bionic",
+                     393, 852, 1179, 2556, 3, 6144, @[@128,@256,@512,@1024], @"16.0", 26),
+            NDDevice(@"iPhone 14 Pro Max", @"iPhone15,3", @"D74AP", @"iPhone14ProMax", @"Apple A16 Bionic",
+                     430, 932, 1290, 2796, 3, 6144, @[@128,@256,@512,@1024], @"16.0", 26),
+            NDDevice(@"iPhone 14 Plus", @"iPhone14,8", @"D28AP", @"iPhone14Plus", @"Apple A15 Bionic",
+                     428, 926, 1284, 2778, 3, 6144, @[@128,@256,@512], @"16.0.2", 26),
+            NDDevice(@"iPhone 15", @"iPhone15,4", @"D37AP", @"iPhone15", @"Apple A16 Bionic",
+                     393, 852, 1179, 2556, 3, 6144, @[@128,@256,@512], @"17.0", 26),
+            NDDevice(@"iPhone 15 Plus", @"iPhone15,5", @"D38AP", @"iPhone15Plus", @"Apple A16 Bionic",
+                     430, 932, 1290, 2796, 3, 6144, @[@128,@256,@512], @"17.0", 26),
+            NDDevice(@"iPhone 15 Pro", @"iPhone16,1", @"D83AP", @"iPhone15Pro", @"Apple A17 Pro",
+                     393, 852, 1179, 2556, 3, 8192, @[@128,@256,@512,@1024], @"17.0", 26),
+            NDDevice(@"iPhone 15 Pro Max", @"iPhone16,2", @"D84AP", @"iPhone15ProMax", @"Apple A17 Pro",
+                     430, 932, 1290, 2796, 3, 8192, @[@256,@512,@1024], @"17.0", 26),
+            NDDevice(@"iPhone 16", @"iPhone17,3", @"D47AP", @"iPhone16", @"Apple A18",
+                     393, 852, 1179, 2556, 3, 8192, @[@128,@256,@512], @"18.0", 26),
+            NDDevice(@"iPhone 16 Plus", @"iPhone17,4", @"D48AP", @"iPhone16Plus", @"Apple A18",
+                     430, 932, 1290, 2796, 3, 8192, @[@128,@256,@512], @"18.0", 26),
+            NDDevice(@"iPhone 16 Pro", @"iPhone17,1", @"D93AP", @"iPhone16Pro", @"Apple A18 Pro",
+                     402, 874, 1206, 2622, 3, 8192, @[@128,@256,@512,@1024], @"18.0", 26),
+            NDDevice(@"iPhone 16 Pro Max", @"iPhone17,2", @"D94AP", @"iPhone16ProMax", @"Apple A18 Pro",
+                     440, 956, 1320, 2868, 3, 8192, @[@256,@512,@1024], @"18.0", 26),
+            NDDevice(@"iPhone 16e", @"iPhone17,5", @"V59AP", @"iPhone16e", @"Apple A18",
+                     390, 844, 1170, 2532, 3, 8192, @[@128,@256,@512], @"18.3.1", 26),
+            NDDevice(@"iPhone 17", @"iPhone18,3", @"V57AP", @"iPhone17", @"Apple A19",
+                     402, 874, 1206, 2622, 3, 8192, @[@256,@512], @"26.0", 26),
+            NDDevice(@"iPhone 17 Pro", @"iPhone18,1", @"V53AP", @"iPhone17Pro", @"Apple A19 Pro",
+                     402, 874, 1206, 2622, 3, 12288, @[@256,@512,@1024], @"26.0", 26),
+            NDDevice(@"iPhone 17 Pro Max", @"iPhone18,2", @"V54AP", @"iPhone17ProMax", @"Apple A19 Pro",
+                     440, 956, 1320, 2868, 3, 12288, @[@256,@512,@1024], @"26.0", 26),
+            NDDevice(@"iPhone Air", @"iPhone18,4", @"D23AP", @"iPhoneAir", @"Apple A19 Pro",
+                     420, 912, 1260, 2736, 3, 12288, @[@256,@512,@1024], @"26.0", 26),
+            NDDevice(@"iPhone 17e", @"iPhone18,5", @"V159AP", @"iPhone17e", @"Apple A19",
+                     390, 844, 1170, 2532, 3, 8192, @[@128,@256,@512], @"26.3.1", 26),
         ];
     });
     return profiles;
@@ -114,7 +188,12 @@ static NSArray<NSDictionary *> *NDSystemProfiles(void) {
             NDSystem(@"18.3.2", @"22D82"), NDSystem(@"18.4", @"22E240"),
             NDSystem(@"18.4.1", @"22E252"), NDSystem(@"18.5", @"22F76"),
             NDSystem(@"18.6", @"22G86"), NDSystem(@"18.6.1", @"22G90"),
-            NDSystem(@"18.6.2", @"22G100"),
+            NDSystem(@"18.6.2", @"22G100"), NDSystem(@"18.7", @"22H20"),
+            NDSystem(@"18.7.1", @"22H31"), NDSystem(@"18.7.2", @"22H123"),
+            NDSystem(@"18.7.9", @"22H355"), NDSystem(@"18.7.10", @"22H374"),
+            NDSystem(@"26.4.2", @"23E261"), NDSystem(@"26.5", @"23F77"),
+            NDSystem(@"26.5.2", @"23F84"), NDSystem(@"26.6", @"23G71"),
+            NDSystem(@"26.6.1", @"23G83"),
         ];
     });
     return profiles;
@@ -125,6 +204,19 @@ static BOOL NDVersionInRange(NSString *version, NSDictionary *device) {
     NSInteger maximumMajor = [device[@"maximumMajor"] integerValue];
     if ([version compare:minimum options:NSNumericSearch] == NSOrderedAscending) return NO;
     if (version.integerValue > maximumMajor) return NO;
+    NSString *machine = device[@"machine"];
+    // 18.7.9/18.7.10 为特定安全版本，仅向对应机型推送（与极速版 BDSpoofer 口径一致）。
+    if ([version hasPrefix:@"18.7.9"] || [version hasPrefix:@"18.7.10"]) {
+        return [machine hasPrefix:@"iPhone11,"];
+    }
+    // iOS 26 仅支持 iPhone 11（A13）及更新，iPhone XR/XS（iPhone11,x，A12）不支持。
+    if (version.integerValue == 26 &&
+        ![machine hasPrefix:@"iPhone12,"] && ![machine hasPrefix:@"iPhone13,"] &&
+        ![machine hasPrefix:@"iPhone14,"] && ![machine hasPrefix:@"iPhone15,"] &&
+        ![machine hasPrefix:@"iPhone16,"] && ![machine hasPrefix:@"iPhone17,"] &&
+        ![machine hasPrefix:@"iPhone18,"]) {
+        return NO;
+    }
     return YES;
 }
 
@@ -187,6 +279,7 @@ static NSDictionary *NDRandomConfigForDevice(NSDictionary *existing, NSDictionar
         @"spoofUA": @YES,
         @"spoofIDFV": @YES,
         @"spoofStorage": @YES,
+        @"spoofScreen": @YES,
         @"seedPassCustom": @YES,
         @"hwMachine": device[@"machine"],
         @"hwModel": device[@"model"],
@@ -198,7 +291,7 @@ static NSDictionary *NDRandomConfigForDevice(NSDictionary *existing, NSDictionar
         @"diskSize": disk,
         @"deviceName": deviceName,
         @"kernHostname": deviceName,
-        // 屏幕字段仅用于管理器展示；dylib 不 hook UIScreen（两机与真机同屏）
+        // 屏幕字段：dylib 仅改写百度统计 EBAppLog 上报值，不 hook UIScreen，布局仍用真机尺寸。
         @"screenWidth": device[@"width"],
         @"screenHeight": device[@"height"],
         @"screenScale": device[@"scale"],
@@ -224,6 +317,7 @@ static NSDictionary *NDSafeConfig(NSDictionary *existing) {
         @"spoofUA": @NO,
         @"spoofIDFV": @NO,
         @"spoofStorage": @NO,
+        @"spoofScreen": @NO,
         @"seedPassCustom": @NO,
     }];
     return config;

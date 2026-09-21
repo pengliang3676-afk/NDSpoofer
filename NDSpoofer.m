@@ -1,7 +1,12 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.20-05
+//  版本：9.21-01
+//
+//  9.21-01 新增（13.33.6 解密二进制反汇编证据：Passport 登录层不读屏幕，屏幕只进百度移动统计
+//  EBAppLogDeviceHelper 的 +resolution / +resolutionString / +screenScale；而 UIScreen.bounds 被
+//  1406 个函数就地实读，改全局 UIScreen 必致布局卡死/触摸失效）：仅 hook 上述三个统计类方法，
+//  只改上报值、绝不触碰 UIScreen；机型池扩到 36 套异屏机型，每套屏幕/内存/磁盘/系统自洽。
 //
 //  9.20-03 新增（NDProbe4 证据：NADSplash 启动日志 / sofire 风控经 NSProcessInfo 读取真机
 //  物理内存与系统版本，绕过 sysctl 与 UIDevice hook，造成 di 与启动日志/风控的内存、系统
@@ -27,8 +32,9 @@
 //   2a. 9.20-01 新增原生 UA 出口改写（非 JS）：WKWebView setCustomUserAgent:、
 //      BDPUserAgent webViewDefaultUserAgent、NSMutableURLRequest UA 头、
 //      NSURLSession dataTask 出口；覆盖 WAP 登录页与 native 登录链。
-//   3. 机型池只允许与真机同屏（375x667 @2x / 750x1334）的机型，UIScreen 不 hook，
-//      从根上消除“机型与屏幕矛盾”。
+//   3. 9.21-01 起机型池扩到异屏机型；屏幕只改百度统计 EBAppLogDeviceHelper 的上报值
+//      （resolution/resolutionString/screenScale），绝不 hook UIScreen，布局仍用真机尺寸，
+//      从根上避免改全局屏幕导致的布局卡死/触摸失效。
 //   4. 不碰 App 版本、Sapi SDK 版本、tpl、cuid/utdid/deviceID、TeamID、运营商（默认）。
 //   5. 任何开关关闭或配置缺失一律透传原实现；hook 安装前做类型编码校验，不匹配就不装。
 //
@@ -71,6 +77,7 @@ static NSString * const NDConfigFileName = @"ndspoofer_config.plist";
 @property(nonatomic, assign) BOOL spoofUA;
 @property(nonatomic, assign) BOOL spoofIDFV;
 @property(nonatomic, assign) BOOL spoofStorage;
+@property(nonatomic, assign) BOOL spoofScreen;
 @property(nonatomic, assign) BOOL seedPassCustom;
 @property(nonatomic, copy) NSString *hwMachine;
 @property(nonatomic, copy) NSString *hwModel;
@@ -81,6 +88,11 @@ static NSString * const NDConfigFileName = @"ndspoofer_config.plist";
 @property(nonatomic, copy) NSString *kernHostname;
 @property(nonatomic, assign) NSInteger memorySizeMB;
 @property(nonatomic, assign) NSInteger diskSizeGB;
+@property(nonatomic, assign) CGFloat screenWidth;
+@property(nonatomic, assign) CGFloat screenHeight;
+@property(nonatomic, assign) CGFloat nativeScreenWidth;
+@property(nonatomic, assign) CGFloat nativeScreenHeight;
+@property(nonatomic, assign) CGFloat screenScale;
 @property(nonatomic, copy) NSString *idfv;
 @property(nonatomic, copy) NSString *passSdkVersion;
 // 真机基线（只读，用于字符串比对替换）
@@ -113,6 +125,10 @@ static BOOL NDCfgBool(NSDictionary *d, NSString *key, BOOL def) {
 static NSInteger NDCfgInt(NSDictionary *d, NSString *key, NSInteger def) {
     id v = d[key];
     return [v isKindOfClass:NSNumber.class] ? [v integerValue] : def;
+}
+static double NDCfgDouble(NSDictionary *d, NSString *key, double def) {
+    id v = d[key];
+    return [v isKindOfClass:NSNumber.class] ? [v doubleValue] : def;
 }
 
 static NSString *NDRealSysctlStr(const char *name) {
@@ -157,6 +173,7 @@ static void NDLoadConfig(void) {
         c.spoofUA          = NDCfgBool(d, @"spoofUA", NO);
         c.spoofIDFV        = NDCfgBool(d, @"spoofIDFV", NO);
         c.spoofStorage     = NDCfgBool(d, @"spoofStorage", NO);
+        c.spoofScreen      = NDCfgBool(d, @"spoofScreen", NO);
         c.seedPassCustom   = NDCfgBool(d, @"seedPassCustom", NO);
         c.hwMachine        = NDCfgStr(d, @"hwMachine", @"");
         c.hwModel          = NDCfgStr(d, @"hwModel", @"");
@@ -167,6 +184,11 @@ static void NDLoadConfig(void) {
         c.kernHostname     = NDCfgStr(d, @"kernHostname", @"");
         c.memorySizeMB     = NDCfgInt(d, @"memorySize", 0);
         c.diskSizeGB       = NDCfgInt(d, @"diskSize", 0);
+        c.screenWidth        = NDCfgDouble(d, @"screenWidth", 0);
+        c.screenHeight       = NDCfgDouble(d, @"screenHeight", 0);
+        c.nativeScreenWidth  = NDCfgDouble(d, @"nativeScreenWidth", 0);
+        c.nativeScreenHeight = NDCfgDouble(d, @"nativeScreenHeight", 0);
+        c.screenScale        = NDCfgDouble(d, @"screenScale", 0);
         c.idfv             = NDCfgStr(d, @"idfv", @"");
         c.passSdkVersion   = NDCfgStr(d, @"passSdkVersion", @"9.8.12.20");
 
@@ -595,6 +617,9 @@ static IMP nd_o_uaCompose = NULL;
 static IMP nd_o_physMem = NULL;       // NSProcessInfo physicalMemory
 static IMP nd_o_osVerString = NULL;  // NSProcessInfo operatingSystemVersionString
 static IMP nd_o_osVer = NULL;        // NSProcessInfo operatingSystemVersion（结构体返回）
+static IMP nd_o_ebResolution = NULL;        // EBAppLogDeviceHelper +resolution（CGSize 结构体）
+static IMP nd_o_ebResolutionString = NULL;  // EBAppLogDeviceHelper +resolutionString
+static IMP nd_o_ebScreenScale = NULL;       // EBAppLogDeviceHelper +screenScale
 
 static int g_installed = 0;
 static int g_installAttempts = 0;
@@ -803,6 +828,86 @@ static void NDInstallOSVersionStruct(void) {
     g_installed++;
 }
 
+// --- EBAppLogDeviceHelper（百度移动统计 统一设备信息）屏幕出口 ---
+// 仅改写上报值（物理分辨率 / 分辨率串 / 缩放倍数），绝不触碰 UIScreen，布局与触摸不受影响。
+static BOOL NDScreenActive(NDConfig *c) {
+    return c && c.enabled && c.spoofScreen &&
+           c.screenWidth > 0 && c.screenHeight > 0 && c.screenScale > 0;
+}
+
+// +resolution 原实现（13.33.6 反汇编确认）= bounds.width*scale × bounds.height*scale，
+// 即“逻辑点×scale”的渲染像素，并非 nativeBounds。8 Plus/mini 面板有下采样，
+// 渲染像素（如 1242×2208）≠面板物理像素（1080×1920），故必须同口径返回逻辑×scale。
+// CGSize 为 {CGSize=dd}，16 字节，arm64 经 d0/d1 返回，无 sret。
+static CGSize nd_hook_ebResolution(id self, SEL _cmd) {
+    NDConfig *c = NDCurrentConfig();
+    if (NDScreenActive(c)) {
+        return CGSizeMake(c.screenWidth * c.screenScale,
+                          c.screenHeight * c.screenScale);
+    }
+    if (nd_o_ebResolution) {
+        return ((CGSize (*)(id, SEL))nd_o_ebResolution)(self, _cmd);
+    }
+    return CGSizeMake(0, 0);
+}
+
+// +screenScale 返回 double（2.0 / 3.0）。
+static double nd_hook_ebScreenScale(id self, SEL _cmd) {
+    NDConfig *c = NDCurrentConfig();
+    if (NDScreenActive(c) && c.screenScale > 0) {
+        return (double)c.screenScale;
+    }
+    if (nd_o_ebScreenScale) {
+        return ((double (*)(id, SEL))nd_o_ebScreenScale)(self, _cmd);
+    }
+    return 2.0;
+}
+
+// +resolutionString：先调原实现拿到真机格式（如 750*1334），只替换前两组数字为目标物理像素，
+// 分隔符与后缀保持原样，避免猜测格式串。
+static NSString *nd_hook_ebResolutionString(id self, SEL _cmd) {
+    NSString *orig = nd_o_ebResolutionString
+        ? ((NSString *(*)(id, SEL))nd_o_ebResolutionString)(self, _cmd) : nil;
+    NDConfig *c = NDCurrentConfig();
+    if (!NDScreenActive(c)) return orig;
+    if ([orig isKindOfClass:NSString.class] && orig.length) {
+        NSRegularExpression *rx = [NSRegularExpression
+            regularExpressionWithPattern:@"\\d+" options:0 error:nil];
+        NSArray<NSTextCheckingResult *> *ms = [rx matchesInString:orig
+                                                          options:0
+                                                            range:NSMakeRange(0, orig.length)];
+        if (ms.count >= 2) {
+            NSMutableString *out = [orig mutableCopy];
+            double rw = c.screenWidth * c.screenScale;
+            double rh = c.screenHeight * c.screenScale;
+            // 从后往前替换，避免 range 偏移；与 +resolution 同为逻辑×scale 口径。
+            [out replaceCharactersInRange:ms[1].range
+                                withString:[NSString stringWithFormat:@"%.0f", rh]];
+            [out replaceCharactersInRange:ms[0].range
+                                withString:[NSString stringWithFormat:@"%.0f", rw]];
+            return out;
+        }
+    }
+    return [NSString stringWithFormat:@"%.0f*%.0f",
+            c.screenWidth * c.screenScale, c.screenHeight * c.screenScale];
+}
+
+// +resolution 为 CGSize 结构体返回，严格校验类型编码（{CGSize=dd}）与 0 参数后再替换。
+static void NDInstallEBResolution(void) {
+    if (nd_o_ebResolution) return;
+    Class cls = NSClassFromString(@"EBAppLogDeviceHelper");
+    if (!cls) return;
+    SEL sel = NSSelectorFromString(@"resolution");
+    Method m = class_getInstanceMethod(object_getClass(cls), sel);  // 类方法（元类）
+    if (!m) m = class_getInstanceMethod(cls, sel);                  // 实例方法兜底
+    if (!m) return;
+    const char *types = method_getTypeEncoding(m);
+    if (!types || types[0] != '{' || !strstr(types, "CGSize")) return;
+    if (method_getNumberOfArguments(m) - 2 != 0) return;
+    nd_o_ebResolution = method_setImplementation(m, (IMP)nd_hook_ebResolution);
+    g_installed++;
+}
+
 static void NDInstallAll(void) {
     // UIDevice 实例方法（含 category：platform/bdc_platformString/bba_cachedSystemVersion）
     NDInstallOne(@"UIDevice", @selector(systemVersion), NO, '@', 0, "",
@@ -848,6 +953,13 @@ static void NDInstallAll(void) {
     NDInstallOne(@"NSProcessInfo", @selector(operatingSystemVersionString), NO,
                  '@', 0, "", (IMP)nd_hook_osVerString, &nd_o_osVerString);
     NDInstallOSVersionStruct();
+
+    // EBAppLogDeviceHelper：仅改写百度统计上报的物理分辨率/分辨率串/缩放倍数，不碰 UIScreen。
+    NDInstallOne(@"EBAppLogDeviceHelper", NSSelectorFromString(@"screenScale"), YES,
+                 'd', 0, "", (IMP)nd_hook_ebScreenScale, &nd_o_ebScreenScale);
+    NDInstallOne(@"EBAppLogDeviceHelper", NSSelectorFromString(@"resolutionString"), YES,
+                 '@', 0, "", (IMP)nd_hook_ebResolutionString, &nd_o_ebResolutionString);
+    NDInstallEBResolution();
 }
 
 static volatile int g_ndDrainQueued = 0;
@@ -1247,15 +1359,17 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.20-05\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-01\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
-    [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\nPASS_CUSTOM：%@\n",
+    [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
         c.spoofUA ? @"开" : @"关", c.spoofIDFV ? @"开" : @"关", c.spoofStorage ? @"开" : @"关",
-        c.seedPassCustom ? @"开" : @"关"];
-    [r appendFormat:@"\n伪装机型：%@ (%@)\n营销名：%@\n伪装系统：%@ (%@)\n内存：%ldMB\n磁盘：%ldGB\n",
+        c.spoofScreen ? @"开" : @"关", c.seedPassCustom ? @"开" : @"关"];
+    [r appendFormat:@"\n伪装机型：%@ (%@)\n营销名：%@\n伪装系统：%@ (%@)\n内存：%ldMB\n磁盘：%ldGB\n配置屏幕：%.0fx%.0f @%.0fx / 物理%.0fx%.0f\n",
         c.hwMachine, c.hwModel, c.marketingName, c.systemVersion, c.systemBuild,
-        (long)c.memorySizeMB, (long)c.diskSizeGB];
+        (long)c.memorySizeMB, (long)c.diskSizeGB,
+        c.screenWidth, c.screenHeight, c.screenScale,
+        c.nativeScreenWidth, c.nativeScreenHeight];
     [r appendFormat:@"\n真机机型：%@ (%@)\n真机系统：%@ (%@)\n真机内存：%lluMB\n真机磁盘：%lluGB\n",
         c.realMachine, c.realModel, c.realOSVersion, c.realBuild,
         c.realMemBytes / 1024 / 1024, c.realDiskBytes / 1024 / 1024 / 1024];
@@ -1287,6 +1401,29 @@ static void NDShowReport(void) {
     }
     [r appendFormat:@"NAD UA：%@\n", NDShortUA([d stringForKey:@"NADUserAgentKey"])];
     [r appendFormat:@"BBA Check：%@\n", [d stringForKey:@"BBAUserAgentCheckInfoKey"] ?: @"(未写入)"];
+
+    // 9.21-01 屏幕通道自检：直接调用百度统计类方法会经过 hook，显示上报层实际值（非 UIScreen）。
+    Class ebCls = NSClassFromString(@"EBAppLogDeviceHelper");
+    if (ebCls) {
+        [r appendString:@"\n—— 9.21-01 屏幕上报自检（EBAppLog）——\n"];
+        SEL sRes = NSSelectorFromString(@"resolution");
+        SEL sScale = NSSelectorFromString(@"screenScale");
+        SEL sStr = NSSelectorFromString(@"resolutionString");
+        if ([ebCls respondsToSelector:sRes]) {
+            CGSize ebR = ((CGSize (*)(id, SEL))[ebCls methodForSelector:sRes])(ebCls, sRes);
+            [r appendFormat:@"统计上报分辨率：%.0fx%.0f（逻辑×scale）\n", ebR.width, ebR.height];
+        }
+        if ([ebCls respondsToSelector:sScale]) {
+            double ebS = ((double (*)(id, SEL))[ebCls methodForSelector:sScale])(ebCls, sScale);
+            [r appendFormat:@"统计缩放倍数：%.2f\n", ebS];
+        }
+        if ([ebCls respondsToSelector:sStr]) {
+            NSString *ebStr = ((NSString *(*)(id, SEL))[ebCls methodForSelector:sStr])(ebCls, sStr);
+            [r appendFormat:@"统计分辨率串：%@\n", ebStr ?: @"-"];
+        }
+    } else {
+        [r appendString:@"\nEBAppLogDeviceHelper：(类未加载，进 App 后再看)\n"];
+    }
 
     UIActivityViewController *ac = [[UIActivityViewController alloc] initWithActivityItems:@[r]
                                                                       applicationActivities:nil];
