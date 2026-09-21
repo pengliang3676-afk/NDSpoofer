@@ -1,7 +1,11 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-14
+//  版本：9.21-15
+//
+//  9.21-15：14 明文 [3]/[4] 自洽，但 [20]/[21] 被旧逻辑当成 ram/disk。mapper 实测
+//  [20]=mtj_cuid [21]=baidumap_cuid [15]=internal_memory。把内存数字写进 cuid 会
+//  把 di 写坏。改为改 [15] 磁盘、[14] CPU、[11] is_root，不再动 cuid。不注入 JS。
 //
 //  9.21-14：13 登录 POST /v3/login/api/auth formbody has_di=1 且写入了 PhoneModel，
 //  列表仍未知。客户端已送出。不再改登录 body（避免多余字段干扰）。只读记下加密前
@@ -466,49 +470,55 @@ static NSString *NDRewriteDeviceInfoLine(NSString *s, NDConfig *c) {
     return [NSString stringWithFormat:@"%@_%@", head, c.systemVersion];
 }
 
-// SAPI 明文设备串以 \x01（SOH）分隔，字段顺序固定（deviceInfoKeyMapper）：
-// [3] PhoneModel、[4] SystemVersion、[20] ram(KB)、[21] internal_memory(KB)。
-// 9.20-02 修正：旧版误按空格切分，真机明文无空格导致整体 no-op，内存/磁盘从未改写，
-// 上报 iPhone10,1（iPhone 8/2GB）却带真机 3GB 内存，服务端设备管理页据此判“未知设备”。
+// SAPI 明文设备串以 \x01（SOH）分隔。deviceInfoKeyMapper 实测键序：
+// [3] PhoneModel [4] SystemVersion [11] is_root [12] emulator [14] cpu_info
+// [15] internal_memory [16] internal_avail_memory [20] mtj_cuid [21] baidumap_cuid
+// 9.21-15：旧代码把 ram/disk 写进 [20]/[21]（cuid），等于把 di 写坏；磁盘应写 [15]。
 static NSString *NDRewriteSapiPlain(NSString *s, NDConfig *c) {
     if (![s isKindOfClass:NSString.class] || !s.length) return s;
     NSString *sep = @"\x01";
     if ([s rangeOfString:sep].location == NSNotFound) return s;
     NSMutableArray<NSString *> *f = [[s componentsSeparatedByString:sep] mutableCopy];
-    if (f.count < 22) return s; // 字段结构不符预期，原样返回，绝不误改
+    if (f.count < 16) return s;
 
-    // [3] PhoneModel：兜底（底层 UIDevice/SAPI hook 通常已改）
-    if (c.hwMachine.length && f[3].length && ![f[3] isEqualToString:c.hwMachine]) {
+    if (c.hwMachine.length && f.count > 3 && f[3].length && ![f[3] isEqualToString:c.hwMachine])
         f[3] = c.hwMachine;
-    }
-    // [4] SystemVersion：仅当是 数字.数字[.数字] 形态才改
-    if (c.systemVersion.length && f[4].length) {
+    if (c.systemVersion.length && f.count > 4 && f[4].length) {
         NSRegularExpression *verRx = [NSRegularExpression regularExpressionWithPattern:
             @"^\\d+\\.\\d+(?:\\.\\d+)?$" options:0 error:nil];
-        if ([verRx firstMatchInString:f[4] options:0 range:NSMakeRange(0, f[4].length)]) {
+        if ([verRx firstMatchInString:f[4] options:0 range:NSMakeRange(0, f[4].length)])
             f[4] = c.systemVersion;
-        }
     }
-    // [20] ram：总内存（KB）。iPhone 8 物理内存 2GB，真机 SE2 为 3GB，
-    // 这是设备管理页判定“未知设备”的核心矛盾，必须按机型改写。
-    if (c.memorySizeMB > 0 && f[20].length &&
-        [f[20] rangeOfString:@"^\\d+$" options:NSRegularExpressionSearch].location != NSNotFound) {
-        f[20] = [NSString stringWithFormat:@"%ld", (long)c.memorySizeMB * 1024L];
+    if (f.count > 12) {
+        NSString *root = f[11].lowercaseString;
+        if ([root isEqualToString:@"1"] || [root isEqualToString:@"true"] || [root isEqualToString:@"yes"])
+            f[11] = @"0";
+        NSString *emu = f[12].lowercaseString;
+        if ([emu isEqualToString:@"1"] || [emu isEqualToString:@"true"] || [emu isEqualToString:@"yes"])
+            f[12] = @"0";
     }
-    // [21] internal_memory：总磁盘（KB）。仅当档案容量档位与真机不同时才改；
-    // 机型池固定 iPhone 8 为 64GB、真机同为 64GB 时保持原值（真实文件系统总容量），天然自洽。
-    if (c.diskSizeGB > 0 && c.realDiskBytes > 0 && f[21].length &&
-        [f[21] rangeOfString:@"^\\d+$" options:NSRegularExpressionSearch].location != NSNotFound) {
-        uint64_t realDiskGB = (c.realDiskBytes + 500000000ULL) / 1000000000ULL;
-        if ((NSInteger)realDiskGB != c.diskSizeGB) {
-            f[21] = [NSString stringWithFormat:@"%lld", (long long)c.diskSizeGB * 1024LL * 1024LL];
+    if (c.cpuBrand.length && f.count > 14 && f[14].length && ![f[14] containsString:c.cpuBrand])
+        f[14] = c.cpuBrand;
+    if (c.diskSizeGB > 0 && f.count > 15 && f[15].length &&
+        [f[15] rangeOfString:@"^\\d+$" options:NSRegularExpressionSearch].location != NSNotFound) {
+        long long oldTot = f[15].longLongValue;
+        long long newTot = (long long)c.diskSizeGB * 1024LL * 1024LL;
+        if (oldTot != newTot) {
+            f[15] = [NSString stringWithFormat:@"%lld", newTot];
+            if (f.count > 16 && f[16].length &&
+                [f[16] rangeOfString:@"^\\d+$" options:NSRegularExpressionSearch].location != NSNotFound &&
+                oldTot > 0) {
+                f[16] = [NSString stringWithFormat:@"%lld", f[16].longLongValue * newTot / oldTot];
+            }
         }
     }
     return [f componentsJoinedByString:sep];
 }
 
 static int g_plainN = 0, g_plainCnt = 0;
-static NSString *g_plainPM = nil, *g_plainVer = nil, *g_plainRam = nil, *g_plainDsk = nil;
+static NSString *g_plainPM = nil, *g_plainVer = nil, *g_plainRoot = nil;
+static NSString *g_plainEmu = nil, *g_plainCpu = nil, *g_plainIMem = nil;
+static NSString *g_plainCuid = nil, *g_plainMapCuid = nil;
 
 static void NDNoteSapiPlainFields(NSString *s) {
     g_plainN++;
@@ -525,8 +535,12 @@ static void NDNoteSapiPlainFields(NSString *s) {
     g_plainCnt = (int)f.count;
     g_plainPM = f.count > 3 ? [f[3] copy] : nil;
     g_plainVer = f.count > 4 ? [f[4] copy] : nil;
-    g_plainRam = f.count > 20 ? [f[20] copy] : nil;
-    g_plainDsk = f.count > 21 ? [f[21] copy] : nil;
+    g_plainRoot = f.count > 11 ? [f[11] copy] : nil;
+    g_plainEmu = f.count > 12 ? [f[12] copy] : nil;
+    g_plainCpu = f.count > 14 ? [f[14] copy] : nil;
+    g_plainIMem = f.count > 15 ? [f[15] copy] : nil;
+    g_plainCuid = f.count > 20 ? [f[20] copy] : nil;
+    g_plainMapCuid = f.count > 21 ? [f[21] copy] : nil;
 }
 
 // ============================== NSUserDefaults 出口收口（NADSplash / sofire / UA 缓存） ==============================
@@ -2516,7 +2530,7 @@ static NSString *NDShortUA(NSString *ua) {
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-14\n\n"];
+    [r appendFormat:@"NDSpoofer 9.21-15\n\n"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -2622,14 +2636,18 @@ static void NDShowReport(void) {
     [r appendString:@"看最近内容里的 has_di。登录 POST 有 di 仍未知 → 看下面明文字段是否自洽。\n"];
     [r appendString:@"登录后看「登录设备」最新一条。\n"];
 
-    [r appendString:@"\n—— 加密前 di 明文（9.21-14）——\n"];
-    [r appendFormat:@"采样次数：%d  字段数：%d（期望≥22）\n", g_plainN, g_plainCnt];
+    [r appendString:@"\n—— 加密前 di 明文（9.21-15）——\n"];
+    [r appendFormat:@"采样次数：%d  字段数：%d\n", g_plainN, g_plainCnt];
     [r appendFormat:@"[3] PhoneModel：%@\n", g_plainPM ?: @"(无)"];
     [r appendFormat:@"[4] SystemVersion：%@\n", g_plainVer ?: @"(无)"];
-    [r appendFormat:@"[20] ram(KB)：%@\n", g_plainRam ?: @"(无)"];
-    [r appendFormat:@"[21] disk(KB)：%@\n", g_plainDsk ?: @"(无)"];
-    [r appendFormat:@"配置内存：%ldMB  配置磁盘：%ldGB\n", (long)c.memorySizeMB, (long)c.diskSizeGB];
-    [r appendString:@"ram 应对齐 配置内存×1024。对不上就是服务端判未知的老原因。\n"];
+    [r appendFormat:@"[11] is_root：%@\n", g_plainRoot ?: @"(无)"];
+    [r appendFormat:@"[12] emulator：%@\n", g_plainEmu ?: @"(无)"];
+    [r appendFormat:@"[14] cpu：%@\n", g_plainCpu ?: @"(无)"];
+    [r appendFormat:@"[15] internal_memory：%@\n", g_plainIMem ?: @"(无)"];
+    [r appendFormat:@"[20] mtj_cuid：%@\n", g_plainCuid ?: @"(无)"];
+    [r appendFormat:@"[21] baidumap_cuid：%@\n", g_plainMapCuid ?: @"(无)"];
+    [r appendFormat:@"配置 CPU：%@  磁盘：%ldGB\n", c.cpuBrand ?: @"-", (long)c.diskSizeGB];
+    [r appendString:@"[20] 应是 cuid 不是内存。internal_memory 应对齐磁盘×1024×1024。\n"];
 
     NDReportVC *rc = [[NDReportVC alloc] initWithReport:r];
     UIViewController *host = NDFloatHostVC();
