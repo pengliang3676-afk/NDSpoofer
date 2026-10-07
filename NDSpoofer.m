@@ -1,8 +1,9 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
 //
-//  版本：9.21-23
+//  版本：9.21-24
 //
+//  9.21-24：新增 HiidoOperator 安装检测伪装：四个读接口返回 nil、_reportInstall:newt:interval: 换值、checkIsNewInstallWithHandler: 回调 YES。
 //  9.21-23：网解管理器 App 图标换成红底白苹果。不注入 JS，不改登录逻辑。
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
@@ -163,6 +164,9 @@ static NSString * const NDConfigFileName = @"ndspoofer_config.plist";
 @property(nonatomic, assign) BOOL spoofIDFV;
 @property(nonatomic, assign) BOOL spoofStorage;
 @property(nonatomic, assign) BOOL spoofScreen;
+@property(nonatomic, assign) BOOL spoofHiidoInstall;
+@property(nonatomic, assign) NSInteger hiidoNewt;
+@property(nonatomic, assign) NSInteger hiidoInterval;
 @property(nonatomic, assign) BOOL seedPassCustom;
 @property(nonatomic, copy) NSString *hwMachine;
 @property(nonatomic, copy) NSString *hwModel;
@@ -276,6 +280,10 @@ static void NDLoadConfig(void) {
         c.screenScale        = NDCfgDouble(d, @"screenScale", 0);
         c.idfv             = NDCfgStr(d, @"idfv", @"");
         c.passSdkVersion   = NDCfgStr(d, @"passSdkVersion", @"9.8.12.20");
+        // Hiido 安装检测伪装（默认关，避免影响未验证的链路）
+        c.spoofHiidoInstall = NDCfgBool(d, @"spoofHiidoInstall", NO);
+        c.hiidoNewt         = NDCfgInt(d, @"hiidoNewt", 0);
+        c.hiidoInterval     = NDCfgInt(d, @"hiidoInterval", 0);
 
         c.realMachine   = NDRealSysctlStr("hw.machine") ?: @"";
         c.realModel     = NDRealSysctlStr("hw.model") ?: @"";
@@ -1682,7 +1690,120 @@ static void NDInstallEBResolution(void) {
     g_installed++;
 }
 
+
+// ============================== Hiido 安装检测伪装 ==============================
+// 9.21-24 新增。证据（13.33.6 objc 元数据解析，33,751 类 / 559,107 方法）：
+//
+//   HiidoOperator(ReportInstall)   _checkAndReportInstall        判定入口
+//       readLastExitInfo_Plist      ┐
+//       readLastExitInfo_KeyChain   ├ 四级冗余存储（删 App / 清容器清不干净）
+//       readLastExitInfo_CacheFile  │
+//       readLastExitInfoFromFile    ┘
+//       writeLastExitInfo_Plist: / _KeyChain: / _CacheFile: / saveLastExitInfoToFile:
+//       lastExitInfoFilePath
+//   LastExitTimeAndVersion
+//       last_exit_time NSNumber / last_exit_version NSString
+//   cKey_last_exit_info / ukey_last_exit_info
+//
+//   HiidoOperator  _reportInstall:newt:interval:   v32@0:8B16i20q24
+//                       ↑BOOL 是否新装  ↑int newtype  ↑long long 间隔
+//   HiidoSDK       checkIsNewInstallWithHandler:   v24@0:8@?16
+//
+// 做法（只改返回值，不碰存储，出问题可即时回退）：
+//   A. 四个读接口统一返回 nil —— 对 _checkAndReportInstall 等价于「没有上次退出信息」，
+//      即首次安装；同时不会去写任何存储。
+//   B. 上报出口把 newt / interval 换成配置值（默认 0 / 0 = 刚装）。
+//   C. 查询出口 checkIsNewInstallWithHandler: 回调 YES。
+//
+// 注意：Hook A 返回 nil 是「无记录」语义，不构造对象，避免类型不匹配崩溃。
+
+static IMP nd_o_hiidoPlist = NULL;
+static IMP nd_o_hiidoKeyChain = NULL;
+static IMP nd_o_hiidoCacheFile = NULL;
+static IMP nd_o_hiidoFromFile = NULL;
+static IMP nd_o_hiidoReportInstall = NULL;
+static IMP nd_o_hiidoCheckNewInstall = NULL;
+
+static BOOL NDHiidoActive(void) {
+    NDConfig *c = NDCurrentConfig();
+    return c && c.enabled && c.spoofHiidoInstall;
+}
+
+// A. 四个读接口 → nil
+static id nd_hook_hiidoReadNil(id self, SEL _cmd) {
+    if (NDHiidoActive()) return nil;
+    // 关掉时按各方法自己的原实现走
+    IMP o = NULL;
+    NSString *n = NSStringFromSelector(_cmd);
+    if ([n isEqualToString:@"readLastExitInfo_Plist"])          o = nd_o_hiidoPlist;
+    else if ([n isEqualToString:@"readLastExitInfo_KeyChain"])  o = nd_o_hiidoKeyChain;
+    else if ([n isEqualToString:@"readLastExitInfo_CacheFile"]) o = nd_o_hiidoCacheFile;
+    else if ([n isEqualToString:@"readLastExitInfoFromFile"])   o = nd_o_hiidoFromFile;
+    return o ? ((id (*)(id, SEL))o)(self, _cmd) : nil;
+}
+
+// B. 上报出口：换 newt / interval
+static void nd_hook_hiidoReportInstall(id self, SEL _cmd, BOOL isNew,
+                                       int newt, long long interval) {
+    if (NDHiidoActive()) {
+        NDConfig *c = NDCurrentConfig();
+        ((void (*)(id, SEL, BOOL, int, long long))nd_o_hiidoReportInstall)(
+            self, _cmd, YES, (int)c.hiidoNewt, (long long)c.hiidoInterval);
+        return;
+    }
+    if (nd_o_hiidoReportInstall) {
+        ((void (*)(id, SEL, BOOL, int, long long))nd_o_hiidoReportInstall)(
+            self, _cmd, isNew, newt, interval);
+    }
+}
+
+// C. 查询出口：回调 YES
+static void nd_hook_hiidoCheckNewInstall(id self, SEL _cmd, id handler) {
+    if (NDHiidoActive()) {
+        if (handler) {
+            void (^blk)(BOOL) = (void (^)(BOOL))handler;
+            blk(YES);
+        }
+        return;
+    }
+    if (nd_o_hiidoCheckNewInstall) {
+        ((void (*)(id, SEL, id))nd_o_hiidoCheckNewInstall)(self, _cmd, handler);
+    }
+}
+
+static void NDInstallHiido(void) {
+    if (nd_o_hiidoPlist) return;   // 已装
+    Class op = NSClassFromString(@"HiidoOperator");
+    if (op) {
+        struct { const char *sel; IMP imp; IMP *slot; } reads[] = {
+            {"readLastExitInfo_Plist",     (IMP)nd_hook_hiidoReadNil, &nd_o_hiidoPlist},
+            {"readLastExitInfo_KeyChain",  (IMP)nd_hook_hiidoReadNil, &nd_o_hiidoKeyChain},
+            {"readLastExitInfo_CacheFile", (IMP)nd_hook_hiidoReadNil, &nd_o_hiidoCacheFile},
+            {"readLastExitInfoFromFile",   (IMP)nd_hook_hiidoReadNil, &nd_o_hiidoFromFile},
+        };
+        for (unsigned i = 0; i < sizeof(reads) / sizeof(reads[0]); i++) {
+            SEL s = NSSelectorFromString([NSString stringWithUTF8String:reads[i].sel]);
+            Method m = class_getInstanceMethod(op, s);
+            if (!m) continue;
+            // 只接受「0 参数、返回对象」的方法
+            if (!NDEncOK(m, '@', 0, "")) continue;
+            *reads[i].slot = method_setImplementation(m, reads[i].imp);
+            g_installed++;
+        }
+        NDInstallOne(@"HiidoOperator", NSSelectorFromString(@"_reportInstall:newt:interval:"),
+                     NO, 'v', 3, "Biq", (IMP)nd_hook_hiidoReportInstall,
+                     &nd_o_hiidoReportInstall);
+    }
+    Class sdk = NSClassFromString(@"HiidoSDK");
+    if (sdk) {
+        NDInstallOne(@"HiidoSDK", NSSelectorFromString(@"checkIsNewInstallWithHandler:"),
+                     NO, 'v', 1, "@?", (IMP)nd_hook_hiidoCheckNewInstall,
+                     &nd_o_hiidoCheckNewInstall);
+    }
+}
+
 static void NDInstallAll(void) {
+    NDInstallHiido();
     // UIDevice 实例方法（含 category：platform/bdc_platformString/bba_cachedSystemVersion）
     NDInstallOne(@"UIDevice", @selector(systemVersion), NO, '@', 0, "",
                  (IMP)nd_hook_systemVersion, &nd_o_systemVersion);

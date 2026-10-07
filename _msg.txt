@@ -1,0 +1,21 @@
+﻿9.21-24: 新增 HiidoOperator 安装检测伪装
+
+证据（13.33.6 objc 元数据解析，33,751 类 / 559,107 方法）：
+  HiidoOperator(ReportInstall)  _checkAndReportInstall
+      readLastExitInfo_Plist / _KeyChain / _CacheFile / FromFile
+      writeLastExitInfo_Plist: / _KeyChain: / _CacheFile: / saveLastExitInfoToFile:
+      lastExitInfoFilePath
+  LastExitTimeAndVersion  last_exit_time(NSNumber) / last_exit_version(NSString)
+  cKey_last_exit_info / ukey_last_exit_info
+  HiidoOperator  _reportInstall:newt:interval:      v32@0:8B16i20q24
+  HiidoSDK       checkIsNewInstallWithHandler:      v24@0:8@?16
+
+改动（只改返回值，不碰存储）：
+  A. 四个读接口统一返回 nil —— 对 _checkAndReportInstall 等价于「无上次退出信息」，
+     即首次安装；同时不写任何存储
+  B. _reportInstall:newt:interval: 把 newt/interval 换成配置值（默认 0/0）
+  C. checkIsNewInstallWithHandler: 回调 YES
+  新增配置：spoofHiidoInstall(默认关) / hiidoNewt / hiidoInterval
+  configVersion 1 -> 2
+
+未碰：writeLastExitInfo_* / saveLastExitInfoToFile:（不写存储，便于回退）
