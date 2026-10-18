@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.18.07
+//  版本：10.18.08
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -2561,7 +2561,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.18.07";
+    titleLbl.text = @"网解 10.18.08";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2671,13 +2671,15 @@ static atomic_int g_afDateReads = 0;
 static atomic_int g_afCounterReads = 0;
 static NSString *g_afLastDate = nil;
 static NSString *g_afLastCounter = nil;
-static IMP nd_o_afObjectForKey = NULL;
-static IMP nd_o_afSetObject = NULL;
+static IMP nd_o_afStringForKey = NULL;
+static IMP nd_o_afTimeForKey = NULL;
+static IMP nd_o_afSetString = NULL;
+static IMP nd_o_afSetTime = NULL;
 
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.18.07\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendFormat:@"网解 10.18.08\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
     if (c.appsFlyerLastInstallDate > 0) {
         NSDate *afDate = [NSDate dateWithTimeIntervalSince1970:c.appsFlyerLastInstallDate];
         NSDateFormatter *fmt = [NSDateFormatter new];
@@ -2686,11 +2688,12 @@ static void NDShowReport(void) {
         int counterReads = atomic_load(&g_afCounterReads);
         [r appendFormat:@"AppsFlyer 安装日期：%@\nAppsFlyer 重装次数：%ld\n",
             [fmt stringFromDate:afDate], (long)c.appsFlyerReinstallCounter];
-        [r appendFormat:@"AppsFlyer 钩子：%@\n", nd_o_afObjectForKey ? @"已装上" : @"没装上"];
+        BOOL afHooked = nd_o_afStringForKey || nd_o_afTimeForKey;
+        [r appendFormat:@"AppsFlyer 钩子：%@\n", afHooked ? @"已装上" : @"没装上"];
         [r appendFormat:@"安装日期读取：%d 次，返回 %@\n", dateReads, g_afLastDate ?: @"(还没读到)"];
         [r appendFormat:@"重装次数读取：%d 次，返回 %@\n\n", counterReads, g_afLastCounter ?: @"(还没读到)"];
         [r appendString:@"读法：次数大于 0，且返回值和上面两行一致，才是已经生效。\n"];
-        if (!nd_o_afObjectForKey)
+        if (!afHooked)
             [r appendString:@"这次钩子没装上，网盘还在读原来的钥匙串。\n\n"];
         else if (dateReads == 0 && counterReads == 0)
             [r appendString:@"钩子已装上，但这次还没读到。完全退出网盘再打开，进首页后再看。\n\n"];
@@ -3141,25 +3144,52 @@ static id NDAppsFlyerValueForKey(NSString *key) {
     return nil;
 }
 
-static id nd_af_objectForKey(id self, SEL _cmd, id key) {
+static void NDAppsFlyerNoteRead(NSString *key, NSString *shown) {
+    if ([key isEqualToString:@"KCAppsFlyerLastInstallDate"]) {
+        atomic_fetch_add(&g_afDateReads, 1);
+        g_afLastDate = [shown copy];
+    } else if ([key isEqualToString:@"KCAppsFlyerRICounter"]) {
+        atomic_fetch_add(&g_afCounterReads, 1);
+        g_afLastCounter = [shown copy];
+    }
+}
+
+static id nd_af_stringForKey(id self, SEL _cmd, id key) {
     id replaced = NDAppsFlyerKey(key) ? NDAppsFlyerValueForKey(key) : nil;
     if (replaced) {
-        if ([key isEqualToString:@"KCAppsFlyerLastInstallDate"]) {
-            atomic_fetch_add(&g_afDateReads, 1);
-            g_afLastDate = [replaced copy];
-        } else if ([key isEqualToString:@"KCAppsFlyerRICounter"]) {
-            atomic_fetch_add(&g_afCounterReads, 1);
-            g_afLastCounter = [replaced copy];
-        }
+        NDAppsFlyerNoteRead(key, replaced);
         return replaced;
     }
-    if (nd_o_afObjectForKey) return ((id (*)(id, SEL, id))nd_o_afObjectForKey)(self, _cmd, key);
+    if (nd_o_afStringForKey) return ((id (*)(id, SEL, id))nd_o_afStringForKey)(self, _cmd, key);
     return nil;
 }
 
-static void nd_af_setObject(id self, SEL _cmd, id value, id key) {
-    if (NDAppsFlyerKey(key)) return;
-    if (nd_o_afSetObject) ((void (*)(id, SEL, id, id))nd_o_afSetObject)(self, _cmd, value, key);
+static double nd_af_timeIntervalForKey(id self, SEL _cmd, id key) {
+    NDConfig *c = NDAppsFlyerKey(key) ? NDCurrentConfig() : nil;
+    if (c && [key isEqualToString:@"KCAppsFlyerLastInstallDate"] && c.appsFlyerLastInstallDate > 0) {
+        NSString *shown = [NSString stringWithFormat:@"%.0f", c.appsFlyerLastInstallDate];
+        NDAppsFlyerNoteRead(key, shown);
+        return c.appsFlyerLastInstallDate;
+    }
+    if (c && [key isEqualToString:@"KCAppsFlyerRICounter"] && c.hasAppsFlyerReinstallCounter) {
+        NSString *shown = [NSString stringWithFormat:@"%ld", (long)c.appsFlyerReinstallCounter];
+        NDAppsFlyerNoteRead(key, shown);
+        return (double)c.appsFlyerReinstallCounter;
+    }
+    if (nd_o_afTimeForKey) return ((double (*)(id, SEL, id))nd_o_afTimeForKey)(self, _cmd, key);
+    return 0;
+}
+
+static BOOL nd_af_setString(id self, SEL _cmd, id value, id key) {
+    if (NDAppsFlyerKey(key)) return YES;
+    if (nd_o_afSetString) return ((BOOL (*)(id, SEL, id, id))nd_o_afSetString)(self, _cmd, value, key);
+    return NO;
+}
+
+static BOOL nd_af_setTime(id self, SEL _cmd, double value, id key) {
+    if (NDAppsFlyerKey(key)) return YES;
+    if (nd_o_afSetTime) return ((BOOL (*)(id, SEL, double, id))nd_o_afSetTime)(self, _cmd, value, key);
+    return NO;
 }
 
 static BOOL NDReplaceOwnedMethod(Class cls, const char *selName, IMP repl, IMP *slot, char expectRet, unsigned expectArgs) {
@@ -3177,16 +3207,14 @@ static BOOL NDReplaceOwnedMethod(Class cls, const char *selName, IMP repl, IMP *
 }
 
 static void NDHookAppsFlyerKeychain(void) {
-    if (nd_o_afObjectForKey && nd_o_afSetObject) return;
+    if (nd_o_afStringForKey && nd_o_afTimeForKey && nd_o_afSetString && nd_o_afSetTime) return;
     Class cls = objc_lookUpClass("AppsFlyerKeychainWrapper");
     if (!cls) return;
-    // 13.35.2 的 AppsFlyer 读钥匙串不走 objectForKey:，走 keychainObjectForKey:。
-    static const char *getters[] = {"keychainObjectForKey:", "keychainoObjectForKey:", "objectForKey:"};
-    static const char *setters[] = {"setKeychainObject:forKey:", "setObject:forKey:"};
-    for (size_t i = 0; i < sizeof(getters) / sizeof(getters[0]); i++)
-        NDReplaceOwnedMethod(cls, getters[i], (IMP)nd_af_objectForKey, &nd_o_afObjectForKey, '@', 3);
-    for (size_t i = 0; i < sizeof(setters) / sizeof(setters[0]); i++)
-        NDReplaceOwnedMethod(cls, setters[i], (IMP)nd_af_setObject, &nd_o_afSetObject, 'v', 4);
+    // 13.35.2 的 AppsFlyerKeychainWrapper 用 stringForKey: / timeIntervalForKey:。
+    NDReplaceOwnedMethod(cls, "stringForKey:", (IMP)nd_af_stringForKey, &nd_o_afStringForKey, '@', 3);
+    NDReplaceOwnedMethod(cls, "timeIntervalForKey:", (IMP)nd_af_timeIntervalForKey, &nd_o_afTimeForKey, 'd', 3);
+    NDReplaceOwnedMethod(cls, "setString:forKey:", (IMP)nd_af_setString, &nd_o_afSetString, 'B', 4);
+    NDReplaceOwnedMethod(cls, "setTimeInterval:forKey:", (IMP)nd_af_setTime, &nd_o_afSetTime, 'B', 4);
 }
 
 static void NDInstallContainerIdentityPass(void) {
