@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.18.06
+//  版本：10.18.07
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -136,6 +136,7 @@
 #import <sys/mount.h>
 #import <os/lock.h>
 #import <stdatomic.h>
+#import <math.h>
 
 #if __has_include(<mach-o/dyld-interposing.h>)
 #import <mach-o/dyld-interposing.h>
@@ -2411,12 +2412,14 @@ static CGRect NDFloatRestFrame(CGRect bounds) {
     return CGRectMake(x, y, size, size);
 }
 
+static CGRect NDHostBounds(void);
+static CGRect NDFloatTargetFrame(void);
+
 static void NDFloatApplyDock(BOOL docked, BOOL animated) {
     if (!g_floatBtn) return;
     g_floatDocked = docked;
-    CGRect bounds = g_floatBtn.superview.bounds;
-    CGRect r = NDFloatRestFrame(bounds);
-    if (docked) r.origin.x = CGRectGetWidth(bounds) - 16.0;
+    CGRect r = NDFloatTargetFrame();
+    g_floatBtn.autoresizingMask = UIViewAutoresizingNone;
     void (^go)(void) = ^{ g_floatBtn.frame = r; };
     if (animated) {
         [UIView animateWithDuration:0.28 delay:0
@@ -2558,7 +2561,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.18.06";
+    titleLbl.text = @"网解 10.18.07";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2674,7 +2677,7 @@ static IMP nd_o_afSetObject = NULL;
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.18.06\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendFormat:@"网解 10.18.07\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
     if (c.appsFlyerLastInstallDate > 0) {
         NSDate *afDate = [NSDate dateWithTimeIntervalSince1970:c.appsFlyerLastInstallDate];
         NSDateFormatter *fmt = [NSDateFormatter new];
@@ -2686,7 +2689,13 @@ static void NDShowReport(void) {
         [r appendFormat:@"AppsFlyer 钩子：%@\n", nd_o_afObjectForKey ? @"已装上" : @"没装上"];
         [r appendFormat:@"安装日期读取：%d 次，返回 %@\n", dateReads, g_afLastDate ?: @"(还没读到)"];
         [r appendFormat:@"重装次数读取：%d 次，返回 %@\n\n", counterReads, g_afLastCounter ?: @"(还没读到)"];
-        [r appendString:@"读法：次数大于 0，且返回值和上面两行一致，才是已经生效。\n\n"];
+        [r appendString:@"读法：次数大于 0，且返回值和上面两行一致，才是已经生效。\n"];
+        if (!nd_o_afObjectForKey)
+            [r appendString:@"这次钩子没装上，网盘还在读原来的钥匙串。\n\n"];
+        else if (dateReads == 0 && counterReads == 0)
+            [r appendString:@"钩子已装上，但这次还没读到。完全退出网盘再打开，进首页后再看。\n\n"];
+        else
+            [r appendString:@"\n"];
     } else {
         [r appendString:@"AppsFlyer 安装日期：未写入（先在管理器点一键随机）\n\n"];
     }
@@ -2834,6 +2843,44 @@ static UIWindowScene *NDActiveWindowScene(void) {
     return fallback;
 }
 
+static CGRect NDHostBounds(void) {
+    UIWindowScene *scene = NDActiveWindowScene();
+    CGRect b = scene ? scene.coordinateSpace.bounds : CGRectZero;
+    if (CGRectGetWidth(b) < 200.0 || CGRectGetHeight(b) < 200.0)
+        b = UIScreen.mainScreen.bounds;
+    if (CGRectGetWidth(b) < 200.0) b = CGRectMake(0, 0, 375, 667);
+    return b;
+}
+
+static CGRect NDFloatTargetFrame(void) {
+    CGRect b = NDHostBounds();
+    CGRect r = NDFloatRestFrame(b);
+    if (g_floatDocked) r.origin.x = CGRectGetWidth(b) - 16.0;
+    return r;
+}
+
+static void NDPlaceFloatButton(void) {
+    if (!g_floatWin || !g_floatBtn) return;
+    CGRect screen = NDHostBounds();
+    if (fabs(CGRectGetWidth(g_floatWin.frame) - CGRectGetWidth(screen)) > 0.5 ||
+        fabs(CGRectGetHeight(g_floatWin.frame) - CGRectGetHeight(screen)) > 0.5 ||
+        fabs(g_floatWin.frame.origin.x) > 0.5 || fabs(g_floatWin.frame.origin.y) > 0.5) {
+        g_floatWin.frame = screen;
+    }
+    g_floatBtn.autoresizingMask = UIViewAutoresizingNone;
+    CGRect r = NDFloatTargetFrame();
+    if (!CGRectEqualToRect(g_floatBtn.frame, r)) g_floatBtn.frame = r;
+}
+
+@interface NDFloatRootVC : UIViewController
+@end
+@implementation NDFloatRootVC
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    NDPlaceFloatButton();
+}
+@end
+
 static void NDEnsureFloatWindow(void) {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ NDEnsureFloatWindow(); });
@@ -2844,23 +2891,24 @@ static void NDEnsureFloatWindow(void) {
         if (scene && g_floatWin.windowScene != scene) g_floatWin.windowScene = scene;
         g_floatWin.windowLevel = UIWindowLevelAlert + 1;
         g_floatWin.hidden = NO;
+        NDPlaceFloatButton();
         return;
     }
     if (!scene) return;
 
     NDFloatWindow *win = [[NDFloatWindow alloc] initWithWindowScene:scene];
-    win.frame = scene.coordinateSpace.bounds;
+    win.frame = NDHostBounds();
     win.windowLevel = UIWindowLevelAlert + 1;
     win.backgroundColor = UIColor.clearColor;
     win.opaque = NO;
     win.userInteractionEnabled = YES;
 
-    UIViewController *root = [[UIViewController alloc] init];
+    NDFloatRootVC *root = [[NDFloatRootVC alloc] init];
     root.view.backgroundColor = UIColor.clearColor;
     win.rootViewController = root;
 
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.frame = NDFloatRestFrame(win.bounds);
+    b.frame = NDFloatRestFrame(NDHostBounds());
     b.layer.cornerRadius = 28;
     b.layer.masksToBounds = YES;
     b.backgroundColor = [UIColor colorWithRed:0.10 green:0.55 blue:0.95 alpha:0.85];
@@ -2871,12 +2919,13 @@ static void NDEnsureFloatWindow(void) {
     [b addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
         NDFloatTapped();
     }] forControlEvents:UIControlEventTouchUpInside];
-    b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
+    b.autoresizingMask = UIViewAutoresizingNone;
     [root.view addSubview:b];
 
     g_floatWin = win;
     g_floatBtn = b;
     win.hidden = NO;
+    NDPlaceFloatButton();
     NDFloatMaybeAlreadyLoggedIn();
 }
 
@@ -2895,7 +2944,7 @@ static void NDSetupFloatButton(void) {
                     }
                     g_floatWin.windowLevel = UIWindowLevelAlert + 1;
                     g_floatWin.hidden = NO;
-                    if (g_floatBtn && !g_floatDocked) g_floatBtn.frame = NDFloatRestFrame(g_floatWin.bounds);
+                    NDPlaceFloatButton();
                 });
             }
         });
@@ -3113,24 +3162,31 @@ static void nd_af_setObject(id self, SEL _cmd, id value, id key) {
     if (nd_o_afSetObject) ((void (*)(id, SEL, id, id))nd_o_afSetObject)(self, _cmd, value, key);
 }
 
+static BOOL NDReplaceOwnedMethod(Class cls, const char *selName, IMP repl, IMP *slot, char expectRet, unsigned expectArgs) {
+    if (!cls || !slot || *slot) return slot && *slot;
+    SEL sel = sel_registerName(selName);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return NO;
+    Class supercls = class_getSuperclass(cls);
+    if (supercls && class_getInstanceMethod(supercls, sel) == m) return NO;
+    char ret[8] = {0};
+    method_getReturnType(m, ret, sizeof(ret));
+    if (ret[0] != expectRet || method_getNumberOfArguments(m) != expectArgs) return NO;
+    *slot = method_setImplementation(m, repl);
+    return YES;
+}
+
 static void NDHookAppsFlyerKeychain(void) {
+    if (nd_o_afObjectForKey && nd_o_afSetObject) return;
     Class cls = objc_lookUpClass("AppsFlyerKeychainWrapper");
     if (!cls) return;
-    unsigned int count = 0;
-    Method *methods = class_copyMethodList(cls, &count);
-    for (unsigned int i = 0; i < count; i++) {
-        SEL sel = method_getName(methods[i]);
-        NSString *name = NSStringFromSelector(sel);
-        char ret[8] = {0};
-        method_getReturnType(methods[i], ret, sizeof(ret));
-        unsigned int args = method_getNumberOfArguments(methods[i]);
-        if ([name isEqualToString:@"objectForKey:"] && ret[0] == '@' && args == 3 && !nd_o_afObjectForKey) {
-            nd_o_afObjectForKey = method_setImplementation(methods[i], (IMP)nd_af_objectForKey);
-        } else if ([name isEqualToString:@"setObject:forKey:"] && ret[0] == 'v' && args == 4 && !nd_o_afSetObject) {
-            nd_o_afSetObject = method_setImplementation(methods[i], (IMP)nd_af_setObject);
-        }
-    }
-    free(methods);
+    // 13.35.2 的 AppsFlyer 读钥匙串不走 objectForKey:，走 keychainObjectForKey:。
+    static const char *getters[] = {"keychainObjectForKey:", "keychainoObjectForKey:", "objectForKey:"};
+    static const char *setters[] = {"setKeychainObject:forKey:", "setObject:forKey:"};
+    for (size_t i = 0; i < sizeof(getters) / sizeof(getters[0]); i++)
+        NDReplaceOwnedMethod(cls, getters[i], (IMP)nd_af_objectForKey, &nd_o_afObjectForKey, '@', 3);
+    for (size_t i = 0; i < sizeof(setters) / sizeof(setters[0]); i++)
+        NDReplaceOwnedMethod(cls, setters[i], (IMP)nd_af_setObject, &nd_o_afSetObject, 'v', 4);
 }
 
 static void NDInstallContainerIdentityPass(void) {
@@ -3183,6 +3239,7 @@ static void nd_constructor(void) {
     @autoreleasepool {
         if (!NDShouldRun()) return;
         NDLoadConfig();
+        NDHookAppsFlyerKeychain();
         NDSetupFloatButton();
         NDInstallContainerIdentity();
         NDConfig *c = NDCurrentConfig();
