@@ -1,10 +1,7 @@
 //
-//  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib（卐解）
+//  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：9.21-24
-//
-//  9.21-24：新增 HiidoOperator 安装检测伪装：四个读接口返回 nil、_reportInstall:newt:interval: 换值、checkIsNewInstallWithHandler: 回调 YES。
-//  9.21-23：网解管理器 App 图标换成红底白苹果。不注入 JS，不改登录逻辑。
+//  版本：10.18.01
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -164,9 +161,6 @@ static NSString * const NDConfigFileName = @"ndspoofer_config.plist";
 @property(nonatomic, assign) BOOL spoofIDFV;
 @property(nonatomic, assign) BOOL spoofStorage;
 @property(nonatomic, assign) BOOL spoofScreen;
-@property(nonatomic, assign) BOOL spoofHiidoInstall;
-@property(nonatomic, assign) NSInteger hiidoNewt;
-@property(nonatomic, assign) NSInteger hiidoInterval;
 @property(nonatomic, assign) BOOL seedPassCustom;
 @property(nonatomic, copy) NSString *hwMachine;
 @property(nonatomic, copy) NSString *hwModel;
@@ -280,10 +274,6 @@ static void NDLoadConfig(void) {
         c.screenScale        = NDCfgDouble(d, @"screenScale", 0);
         c.idfv             = NDCfgStr(d, @"idfv", @"");
         c.passSdkVersion   = NDCfgStr(d, @"passSdkVersion", @"9.8.12.20");
-        // Hiido 安装检测伪装（默认关，避免影响未验证的链路）
-        c.spoofHiidoInstall = NDCfgBool(d, @"spoofHiidoInstall", NO);
-        c.hiidoNewt         = NDCfgInt(d, @"hiidoNewt", 0);
-        c.hiidoInterval     = NDCfgInt(d, @"hiidoInterval", 0);
 
         c.realMachine   = NDRealSysctlStr("hw.machine") ?: @"";
         c.realModel     = NDRealSysctlStr("hw.model") ?: @"";
@@ -1690,120 +1680,7 @@ static void NDInstallEBResolution(void) {
     g_installed++;
 }
 
-
-// ============================== Hiido 安装检测伪装 ==============================
-// 9.21-24 新增。证据（13.33.6 objc 元数据解析，33,751 类 / 559,107 方法）：
-//
-//   HiidoOperator(ReportInstall)   _checkAndReportInstall        判定入口
-//       readLastExitInfo_Plist      ┐
-//       readLastExitInfo_KeyChain   ├ 四级冗余存储（删 App / 清容器清不干净）
-//       readLastExitInfo_CacheFile  │
-//       readLastExitInfoFromFile    ┘
-//       writeLastExitInfo_Plist: / _KeyChain: / _CacheFile: / saveLastExitInfoToFile:
-//       lastExitInfoFilePath
-//   LastExitTimeAndVersion
-//       last_exit_time NSNumber / last_exit_version NSString
-//   cKey_last_exit_info / ukey_last_exit_info
-//
-//   HiidoOperator  _reportInstall:newt:interval:   v32@0:8B16i20q24
-//                       ↑BOOL 是否新装  ↑int newtype  ↑long long 间隔
-//   HiidoSDK       checkIsNewInstallWithHandler:   v24@0:8@?16
-//
-// 做法（只改返回值，不碰存储，出问题可即时回退）：
-//   A. 四个读接口统一返回 nil —— 对 _checkAndReportInstall 等价于「没有上次退出信息」，
-//      即首次安装；同时不会去写任何存储。
-//   B. 上报出口把 newt / interval 换成配置值（默认 0 / 0 = 刚装）。
-//   C. 查询出口 checkIsNewInstallWithHandler: 回调 YES。
-//
-// 注意：Hook A 返回 nil 是「无记录」语义，不构造对象，避免类型不匹配崩溃。
-
-static IMP nd_o_hiidoPlist = NULL;
-static IMP nd_o_hiidoKeyChain = NULL;
-static IMP nd_o_hiidoCacheFile = NULL;
-static IMP nd_o_hiidoFromFile = NULL;
-static IMP nd_o_hiidoReportInstall = NULL;
-static IMP nd_o_hiidoCheckNewInstall = NULL;
-
-static BOOL NDHiidoActive(void) {
-    NDConfig *c = NDCurrentConfig();
-    return c && c.enabled && c.spoofHiidoInstall;
-}
-
-// A. 四个读接口 → nil
-static id nd_hook_hiidoReadNil(id self, SEL _cmd) {
-    if (NDHiidoActive()) return nil;
-    // 关掉时按各方法自己的原实现走
-    IMP o = NULL;
-    NSString *n = NSStringFromSelector(_cmd);
-    if ([n isEqualToString:@"readLastExitInfo_Plist"])          o = nd_o_hiidoPlist;
-    else if ([n isEqualToString:@"readLastExitInfo_KeyChain"])  o = nd_o_hiidoKeyChain;
-    else if ([n isEqualToString:@"readLastExitInfo_CacheFile"]) o = nd_o_hiidoCacheFile;
-    else if ([n isEqualToString:@"readLastExitInfoFromFile"])   o = nd_o_hiidoFromFile;
-    return o ? ((id (*)(id, SEL))o)(self, _cmd) : nil;
-}
-
-// B. 上报出口：换 newt / interval
-static void nd_hook_hiidoReportInstall(id self, SEL _cmd, BOOL isNew,
-                                       int newt, long long interval) {
-    if (NDHiidoActive()) {
-        NDConfig *c = NDCurrentConfig();
-        ((void (*)(id, SEL, BOOL, int, long long))nd_o_hiidoReportInstall)(
-            self, _cmd, YES, (int)c.hiidoNewt, (long long)c.hiidoInterval);
-        return;
-    }
-    if (nd_o_hiidoReportInstall) {
-        ((void (*)(id, SEL, BOOL, int, long long))nd_o_hiidoReportInstall)(
-            self, _cmd, isNew, newt, interval);
-    }
-}
-
-// C. 查询出口：回调 YES
-static void nd_hook_hiidoCheckNewInstall(id self, SEL _cmd, id handler) {
-    if (NDHiidoActive()) {
-        if (handler) {
-            void (^blk)(BOOL) = (void (^)(BOOL))handler;
-            blk(YES);
-        }
-        return;
-    }
-    if (nd_o_hiidoCheckNewInstall) {
-        ((void (*)(id, SEL, id))nd_o_hiidoCheckNewInstall)(self, _cmd, handler);
-    }
-}
-
-static void NDInstallHiido(void) {
-    if (nd_o_hiidoPlist) return;   // 已装
-    Class op = NSClassFromString(@"HiidoOperator");
-    if (op) {
-        struct { const char *sel; IMP imp; IMP *slot; } reads[] = {
-            {"readLastExitInfo_Plist",     (IMP)nd_hook_hiidoReadNil, &nd_o_hiidoPlist},
-            {"readLastExitInfo_KeyChain",  (IMP)nd_hook_hiidoReadNil, &nd_o_hiidoKeyChain},
-            {"readLastExitInfo_CacheFile", (IMP)nd_hook_hiidoReadNil, &nd_o_hiidoCacheFile},
-            {"readLastExitInfoFromFile",   (IMP)nd_hook_hiidoReadNil, &nd_o_hiidoFromFile},
-        };
-        for (unsigned i = 0; i < sizeof(reads) / sizeof(reads[0]); i++) {
-            SEL s = NSSelectorFromString([NSString stringWithUTF8String:reads[i].sel]);
-            Method m = class_getInstanceMethod(op, s);
-            if (!m) continue;
-            // 只接受「0 参数、返回对象」的方法
-            if (!NDEncOK(m, '@', 0, "")) continue;
-            *reads[i].slot = method_setImplementation(m, reads[i].imp);
-            g_installed++;
-        }
-        NDInstallOne(@"HiidoOperator", NSSelectorFromString(@"_reportInstall:newt:interval:"),
-                     NO, 'v', 3, "Biq", (IMP)nd_hook_hiidoReportInstall,
-                     &nd_o_hiidoReportInstall);
-    }
-    Class sdk = NSClassFromString(@"HiidoSDK");
-    if (sdk) {
-        NDInstallOne(@"HiidoSDK", NSSelectorFromString(@"checkIsNewInstallWithHandler:"),
-                     NO, 'v', 1, "@?", (IMP)nd_hook_hiidoCheckNewInstall,
-                     &nd_o_hiidoCheckNewInstall);
-    }
-}
-
 static void NDInstallAll(void) {
-    NDInstallHiido();
     // UIDevice 实例方法（含 category：platform/bdc_platformString/bba_cachedSystemVersion）
     NDInstallOne(@"UIDevice", @selector(systemVersion), NO, '@', 0, "",
                  (IMP)nd_hook_systemVersion, &nd_o_systemVersion);
@@ -2770,31 +2647,7 @@ static NSString *NDShortUA(NSString *ua) {
 
 @end
 
-static NSString *g_ndContainerUDID = nil;
-
-static BOOL NDLooksLikeUDID(NSString *value) {
-    if (![value isKindOfClass:NSString.class] || value.length < 16 || value.length > 80) return NO;
-    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF-"];
-    return [value rangeOfCharacterFromSet:allowed.invertedSet].location == NSNotFound;
-}
-
-static NSString *NDContainerUDID(void) {
-    if (g_ndContainerUDID.length) return g_ndContainerUDID;
-    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/nd_container_udid.txt"];
-    NSString *saved = [[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]
-        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    if (NDLooksLikeUDID(saved)) {
-        g_ndContainerUDID = saved;
-        return saved;
-    }
-    NSMutableString *fresh = [NSMutableString string];
-    for (int i = 0; i < 5; i++) [fresh appendFormat:@"%08x", arc4random()];
-    g_ndContainerUDID = [fresh copy];
-    [[NSFileManager defaultManager] createDirectoryAtPath:path.stringByDeletingLastPathComponent
-                              withIntermediateDirectories:YES attributes:nil error:nil];
-    [fresh writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    return g_ndContainerUDID;
-}
+static NSString *NDContainerUDID(void);
 
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
@@ -2906,7 +2759,7 @@ static void NDShowReport(void) {
     [r appendString:@"看最近内容里的 has_di。登录 POST 有 di 仍未知 → 看下面明文字段是否自洽。\n"];
     [r appendString:@"登录后看「登录设备」最新一条。\n"];
 
-    [r appendString:@"\n—— 加密前 di 明文（9.21-23）——\n"];
+    [r appendString:@"\n—— 加密前 di 明文（9.21-22）——\n"];
     [r appendFormat:@"采样：%d  其中有SOH：%d  字段数：%d\n", g_plainN, g_plainSohN, g_plainCnt];
     [r appendFormat:@"[3] PhoneModel：%@\n", g_plainPM ?: @"(无)"];
     [r appendFormat:@"[4] SystemVersion：%@\n", g_plainVer ?: @"(无)"];
@@ -3004,8 +2857,36 @@ static void NDSetupFloatButton(void) {
     });
 }
 
-// ============================== 10.18.01 容器 UDID ==============================
-// 只替换百度自己的 UDID 读取。不钩系统钥匙串。
+// ============================== 10.18.01 容器身份 ==============================
+// 每个容器一串百度 UDID。只替换百度自己的读取方法，不钩系统钥匙串。
+// hiido 的「上次退出」在钥匙串里是全机共用的。新容器不读那一份；
+// 网盘写退出信息时记在本容器，下次再读回来。不把每次启动都报成新安装。
+
+static NSString *g_ndContainerUDID = nil;
+
+static BOOL NDLooksLikeUDID(NSString *value) {
+    if (![value isKindOfClass:NSString.class] || value.length < 16 || value.length > 80) return NO;
+    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF-"];
+    return [value rangeOfCharacterFromSet:allowed.invertedSet].location == NSNotFound;
+}
+
+static NSString *NDContainerUDID(void) {
+    if (g_ndContainerUDID.length) return g_ndContainerUDID;
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/nd_container_udid.txt"];
+    NSString *saved = [[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]
+        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (NDLooksLikeUDID(saved)) {
+        g_ndContainerUDID = saved;
+        return saved;
+    }
+    NSMutableString *fresh = [NSMutableString string];
+    for (int i = 0; i < 5; i++) [fresh appendFormat:@"%08x", arc4random()];
+    g_ndContainerUDID = [fresh copy];
+    [[NSFileManager defaultManager] createDirectoryAtPath:path.stringByDeletingLastPathComponent
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    [fresh writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    return g_ndContainerUDID;
+}
 
 static NSString *nd_udid_string(id self, SEL _cmd) {
     (void)self; (void)_cmd;
@@ -3030,6 +2911,72 @@ static void NDHookOwnedStringGetter(Class cls, SEL sel, BOOL classMethod) {
     free(methods);
 }
 
+static NSString *NDLastExitPath(void) {
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/nd_last_exit.plist"];
+}
+
+static id nd_hiido_read_keychain(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
+    NSDictionary *saved = [NSDictionary dictionaryWithContentsOfFile:NDLastExitPath()];
+    if (![saved isKindOfClass:NSDictionary.class] || !saved.count) return nil;
+    Class cls = objc_lookUpClass("LastExitTimeAndVersion");
+    if (!cls) return nil;
+    id obj = [[cls alloc] init];
+    if (!obj) return nil;
+    if ([obj respondsToSelector:@selector(setLast_exit_time:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(obj, @selector(setLast_exit_time:), saved[@"last_exit_time"]);
+    }
+    if ([obj respondsToSelector:@selector(setLast_exit_version:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(obj, @selector(setLast_exit_version:), saved[@"last_exit_version"]);
+    }
+    return obj;
+}
+
+static void nd_hiido_write_keychain(id self, SEL _cmd, id info) {
+    (void)self; (void)_cmd;
+    if (!info) return;
+    id time = nil;
+    id version = nil;
+    if ([info respondsToSelector:@selector(last_exit_time)]) {
+        time = ((id (*)(id, SEL))objc_msgSend)(info, @selector(last_exit_time));
+    }
+    if ([info respondsToSelector:@selector(last_exit_version)]) {
+        version = ((id (*)(id, SEL))objc_msgSend)(info, @selector(last_exit_version));
+    }
+    NSMutableDictionary *saved = [NSMutableDictionary dictionary];
+    if (time) saved[@"last_exit_time"] = time;
+    if ([version isKindOfClass:NSString.class] && [version length]) saved[@"last_exit_version"] = version;
+    if (!saved.count) return;
+    NSString *path = NDLastExitPath();
+    [[NSFileManager defaultManager] createDirectoryAtPath:path.stringByDeletingLastPathComponent
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    [saved writeToFile:path atomically:YES];
+}
+
+static BOOL NDHookHiidoKeychain(void) {
+    Class cls = objc_lookUpClass("HiidoOperator");
+    if (!cls) return NO;
+    BOOL hooked = NO;
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    for (unsigned int i = 0; i < count; i++) {
+        SEL sel = method_getName(methods[i]);
+        NSString *name = NSStringFromSelector(sel);
+        char ret[8] = {0};
+        method_getReturnType(methods[i], ret, sizeof(ret));
+        unsigned int args = method_getNumberOfArguments(methods[i]);
+        if ([name isEqualToString:@"readLastExitInfo_KeyChain"] && ret[0] == '@' && args == 2) {
+            method_setImplementation(methods[i], (IMP)nd_hiido_read_keychain);
+            hooked = YES;
+        } else if ([name isEqualToString:@"writeLastExitInfo_KeyChain:"] && ret[0] == 'v' && args == 3) {
+            method_setImplementation(methods[i], (IMP)nd_hiido_write_keychain);
+            hooked = YES;
+        }
+    }
+    free(methods);
+    return hooked;
+}
+
 static int g_ndIdentityTries = 0;
 
 static void NDInstallContainerIdentityPass(void) {
@@ -3047,6 +2994,7 @@ static void NDInstallContainerIdentityPass(void) {
             NDHookOwnedStringGetter(cls, sel, YES);
         }
     }
+    NDHookHiidoKeychain();
     if (++g_ndIdentityTries < 20) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ NDInstallContainerIdentityPass(); });
