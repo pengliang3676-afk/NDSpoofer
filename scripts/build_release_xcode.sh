@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VER="9.21-23"
+VER="10.18.01"
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 COMMON=(-isysroot "$SDK" -miphoneos-version-min=15.0 -fobjc-arc -fblocks -Werror=return-type -Werror=implicit-function-declaration)
 DYLIB_FW=(-framework Foundation -framework UIKit -framework CoreGraphics -framework CoreTelephony -framework Security)
@@ -48,5 +48,7 @@ ar -t "dist/NDSpooferCraneManager_${VER}_RootHide.deb"
 tar -tzf build/deb/data.tar.gz
 
 cp ndspoofer_config.plist dist/
-(cd dist && shasum -a 256 "NDSpoofer_${VER}.dylib" "NDSpooferCraneManager_${VER}_RootHide.deb" > SHA256SUMS.txt)
+cp "dist/NDSpoofer_${VER}.dylib" "dist/M-${VER}.dylib"
+cp "dist/NDSpooferCraneManager_${VER}_RootHide.deb" "dist/X-${VER}.deb"
+(cd dist && shasum -a 256 "M-${VER}.dylib" "X-${VER}.deb" "NDSpoofer_${VER}.dylib" "NDSpooferCraneManager_${VER}_RootHide.deb" > SHA256SUMS.txt)
 cat dist/SHA256SUMS.txt

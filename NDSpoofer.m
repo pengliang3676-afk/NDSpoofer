@@ -2666,7 +2666,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 · 自检报告";
+    titleLbl.text = @"网解 10.18.01";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2770,10 +2770,36 @@ static NSString *NDShortUA(NSString *ua) {
 
 @end
 
+static NSString *g_ndContainerUDID = nil;
+
+static BOOL NDLooksLikeUDID(NSString *value) {
+    if (![value isKindOfClass:NSString.class] || value.length < 16 || value.length > 80) return NO;
+    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF-"];
+    return [value rangeOfCharacterFromSet:allowed.invertedSet].location == NSNotFound;
+}
+
+static NSString *NDContainerUDID(void) {
+    if (g_ndContainerUDID.length) return g_ndContainerUDID;
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/nd_container_udid.txt"];
+    NSString *saved = [[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]
+        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (NDLooksLikeUDID(saved)) {
+        g_ndContainerUDID = saved;
+        return saved;
+    }
+    NSMutableString *fresh = [NSMutableString string];
+    for (int i = 0; i < 5; i++) [fresh appendFormat:@"%08x", arc4random()];
+    g_ndContainerUDID = [fresh copy];
+    [[NSFileManager defaultManager] createDirectoryAtPath:path.stringByDeletingLastPathComponent
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    [fresh writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    return g_ndContainerUDID;
+}
+
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"NDSpoofer 9.21-23\n\n"];
+    [r appendFormat:@"网解 10.18.01\nUDID：%@\n\n", NDContainerUDID()];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -2978,6 +3004,62 @@ static void NDSetupFloatButton(void) {
     });
 }
 
+// ============================== 10.18.01 容器 UDID ==============================
+// 只替换百度自己的 UDID 读取。不钩系统钥匙串。
+
+static NSString *nd_udid_string(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
+    return NDContainerUDID();
+}
+
+static BOOL NDMethodIsStringGetter(Method method) {
+    if (!method || method_getNumberOfArguments(method) != 2) return NO;
+    char type[8] = {0};
+    method_getReturnType(method, type, sizeof(type));
+    return type[0] == '@';
+}
+
+static void NDHookOwnedStringGetter(Class cls, SEL sel, BOOL classMethod) {
+    if (!cls) return;
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(classMethod ? object_getClass(cls) : cls, &count);
+    for (unsigned int i = 0; i < count; i++) {
+        if (method_getName(methods[i]) != sel || !NDMethodIsStringGetter(methods[i])) continue;
+        method_setImplementation(methods[i], (IMP)nd_udid_string);
+    }
+    free(methods);
+}
+
+static int g_ndIdentityTries = 0;
+
+static void NDInstallContainerIdentityPass(void) {
+    static const char *classes[] = {"BaiduUDID", "BaiduMtjUDID", "BMKBaseUDID"};
+    static const char *getters[] = {
+        "getUDID", "udidFromKeychain", "fetchUDIDFromKeyChain", "fetchUDIDFromUserDefaults",
+        "generateUDID", "generateFreshUDID", "generateVerifiableUDID", "createUDID"
+    };
+    for (size_t c = 0; c < sizeof(classes) / sizeof(classes[0]); c++) {
+        Class cls = objc_lookUpClass(classes[c]);
+        if (!cls) continue;
+        for (size_t g = 0; g < sizeof(getters) / sizeof(getters[0]); g++) {
+            SEL sel = sel_registerName(getters[g]);
+            NDHookOwnedStringGetter(cls, sel, NO);
+            NDHookOwnedStringGetter(cls, sel, YES);
+        }
+    }
+    if (++g_ndIdentityTries < 20) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ NDInstallContainerIdentityPass(); });
+    }
+}
+
+static void NDInstallContainerIdentity(void) {
+    NDContainerUDID();
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NDInstallContainerIdentityPass();
+    });
+}
+
 // ============================== 入口 ==============================
 
 static BOOL NDShouldRun(void) {
@@ -2993,6 +3075,7 @@ static void nd_constructor(void) {
     @autoreleasepool {
         if (!NDShouldRun()) return;
         NDLoadConfig();
+        NDInstallContainerIdentity();
         NDConfig *c = NDCurrentConfig();
         if (!c.enabled) return;
         NDSeedPassCustom(c);
