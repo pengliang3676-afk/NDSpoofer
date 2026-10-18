@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.18.04
+//  版本：10.18.05
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -2550,7 +2550,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.18.04";
+    titleLbl.text = @"网解 10.18.05";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2656,16 +2656,17 @@ static NSString *NDShortUA(NSString *ua) {
 
 static NSString *NDContainerUDID(void);
 static NSString *NDContainerCUID(void);
-static atomic_int g_afDateReads;
-static atomic_int g_afCounterReads;
-static NSString *g_afLastDate;
-static NSString *g_afLastCounter;
-static IMP nd_o_afObjectForKey;
+static atomic_int g_afDateReads = 0;
+static atomic_int g_afCounterReads = 0;
+static NSString *g_afLastDate = nil;
+static NSString *g_afLastCounter = nil;
+static IMP nd_o_afObjectForKey = NULL;
+static IMP nd_o_afSetObject = NULL;
 
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.18.04\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendFormat:@"网解 10.18.05\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
     if (c.appsFlyerLastInstallDate > 0) {
         NSDate *afDate = [NSDate dateWithTimeIntervalSince1970:c.appsFlyerLastInstallDate];
         NSDateFormatter *fmt = [NSDateFormatter new];
@@ -2873,7 +2874,7 @@ static void NDEnsureFloatWindow(void) {
 
 static void NDSetupFloatButton(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             NDEnsureFloatWindow();
             if (g_floatBtn) return;
@@ -3057,13 +3058,6 @@ static void NDHookCuidClass(Class cls) {
         NDHookOwnedCuidGetter(cls, sel, YES);
     }
 }
-static IMP nd_o_afObjectForKey = NULL;
-static IMP nd_o_afSetObject = NULL;
-static atomic_int g_afDateReads = 0;
-static atomic_int g_afCounterReads = 0;
-static NSString *g_afLastDate = nil;
-static NSString *g_afLastCounter = nil;
-
 static BOOL NDAppsFlyerKey(id key) {
     return [key isKindOfClass:NSString.class] &&
         ([key isEqualToString:@"KCAppsFlyerLastInstallDate"] ||
@@ -3138,16 +3132,9 @@ static void NDInstallContainerIdentityPass(void) {
             NDHookOwnedStringGetter(cls, sel, YES);
         }
     }
-    if (g_ndIdentityTries == 0 || g_ndIdentityTries == 10) {
-        unsigned int count = 0;
-        Class *all = objc_copyClassList(&count);
-        for (unsigned int i = 0; i < count; i++) {
-            const char *name = class_getName(all[i]);
-            if (!name) continue;
-            if (!strstr(name, "Cuid") && !strstr(name, "CUID") && !strstr(name, "cuid")) continue;
-            NDHookCuidClass(all[i]);
-        }
-        free(all);
+    static const char *cuidClasses[] = {"CuidSDK", "BBACuidSDK", "BDPanCuidSDK", "CUIDSDK"};
+    for (size_t c = 0; c < sizeof(cuidClasses) / sizeof(cuidClasses[0]); c++) {
+        NDHookCuidClass(objc_lookUpClass(cuidClasses[c]));
     }
     NDHookHiidoKeychain();
     NDHookAppsFlyerKeychain();
@@ -3180,6 +3167,7 @@ static void nd_constructor(void) {
     @autoreleasepool {
         if (!NDShouldRun()) return;
         NDLoadConfig();
+        NDSetupFloatButton();
         NDInstallContainerIdentity();
         NDConfig *c = NDCurrentConfig();
         if (!c.enabled) return;
