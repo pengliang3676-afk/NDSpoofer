@@ -2656,6 +2656,11 @@ static NSString *NDShortUA(NSString *ua) {
 
 static NSString *NDContainerUDID(void);
 static NSString *NDContainerCUID(void);
+static atomic_int g_afDateReads;
+static atomic_int g_afCounterReads;
+static NSString *g_afLastDate;
+static NSString *g_afLastCounter;
+static IMP nd_o_afObjectForKey;
 
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
