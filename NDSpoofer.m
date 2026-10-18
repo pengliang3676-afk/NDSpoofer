@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.18.01
+//  版本：10.18.02
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -2543,7 +2543,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.18.01";
+    titleLbl.text = @"网解 10.18.02";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2648,11 +2648,12 @@ static NSString *NDShortUA(NSString *ua) {
 @end
 
 static NSString *NDContainerUDID(void);
+static NSString *NDContainerCUID(void);
 
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.18.01\nUDID：%@\n\n", NDContainerUDID()];
+    [r appendFormat:@"网解 10.18.02\nUDID：%@\nCUID：%@\n\n", NDContainerUDID(), NDContainerCUID()];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -2857,7 +2858,7 @@ static void NDSetupFloatButton(void) {
     });
 }
 
-// ============================== 10.18.01 容器身份 ==============================
+// ============================== 10.18.02 容器身份 ==============================
 // 每个容器一串百度 UDID。只替换百度自己的读取方法，不钩系统钥匙串。
 // hiido 的「上次退出」在钥匙串里是全机共用的。新容器不读那一份；
 // 网盘写退出信息时记在本容器，下次再读回来。不把每次启动都报成新安装。
@@ -2886,6 +2887,32 @@ static NSString *NDContainerUDID(void) {
                               withIntermediateDirectories:YES attributes:nil error:nil];
     [fresh writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     return g_ndContainerUDID;
+}
+
+static NSString *g_ndContainerCUID = nil;
+
+static BOOL NDLooksLikeCUID(NSString *value) {
+    if (![value isKindOfClass:NSString.class] || value.length != 32) return NO;
+    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"0123456789ABCDEF"];
+    return [value rangeOfCharacterFromSet:allowed.invertedSet].location == NSNotFound;
+}
+
+static NSString *NDContainerCUID(void) {
+    if (g_ndContainerCUID.length) return g_ndContainerCUID;
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/nd_container_cuid.txt"];
+    NSString *saved = [[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]
+        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (NDLooksLikeCUID(saved)) {
+        g_ndContainerCUID = saved;
+        return saved;
+    }
+    NSMutableString *fresh = [NSMutableString string];
+    for (int i = 0; i < 4; i++) [fresh appendFormat:@"%08X", arc4random()];
+    g_ndContainerCUID = [fresh copy];
+    [[NSFileManager defaultManager] createDirectoryAtPath:path.stringByDeletingLastPathComponent
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    [fresh writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    return g_ndContainerCUID;
 }
 
 static NSString *nd_udid_string(id self, SEL _cmd) {
@@ -2979,6 +3006,30 @@ static BOOL NDHookHiidoKeychain(void) {
 
 static int g_ndIdentityTries = 0;
 
+static NSString *nd_cuid_string(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
+    return NDContainerCUID();
+}
+
+static void NDHookOwnedCuidGetter(Class cls, SEL sel, BOOL classMethod) {
+    if (!cls) return;
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(classMethod ? object_getClass(cls) : cls, &count);
+    for (unsigned int i = 0; i < count; i++) {
+        if (method_getName(methods[i]) != sel || !NDMethodIsStringGetter(methods[i])) continue;
+        method_setImplementation(methods[i], (IMP)nd_cuid_string);
+    }
+    free(methods);
+}
+
+static void NDHookCuidClass(Class cls) {
+    static const char *getters[] = {"getCUID", "getCuid", "CUID", "cuid"};
+    for (size_t g = 0; g < sizeof(getters) / sizeof(getters[0]); g++) {
+        SEL sel = sel_registerName(getters[g]);
+        NDHookOwnedCuidGetter(cls, sel, NO);
+        NDHookOwnedCuidGetter(cls, sel, YES);
+    }
+}
 static void NDInstallContainerIdentityPass(void) {
     static const char *classes[] = {"BaiduUDID", "BaiduMtjUDID", "BMKBaseUDID"};
     static const char *getters[] = {
@@ -2994,6 +3045,17 @@ static void NDInstallContainerIdentityPass(void) {
             NDHookOwnedStringGetter(cls, sel, YES);
         }
     }
+    if (g_ndIdentityTries == 0 || g_ndIdentityTries == 10) {
+        unsigned int count = 0;
+        Class *all = objc_copyClassList(&count);
+        for (unsigned int i = 0; i < count; i++) {
+            const char *name = class_getName(all[i]);
+            if (!name) continue;
+            if (!strstr(name, "Cuid") && !strstr(name, "CUID") && !strstr(name, "cuid")) continue;
+            NDHookCuidClass(all[i]);
+        }
+        free(all);
+    }
     NDHookHiidoKeychain();
     if (++g_ndIdentityTries < 20) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
@@ -3003,6 +3065,7 @@ static void NDInstallContainerIdentityPass(void) {
 
 static void NDInstallContainerIdentity(void) {
     NDContainerUDID();
+    NDContainerCUID();
     dispatch_async(dispatch_get_main_queue(), ^{
         NDInstallContainerIdentityPass();
     });
