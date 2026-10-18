@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.18.03
+//  版本：10.18.04
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -2550,7 +2550,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.18.03";
+    titleLbl.text = @"网解 10.18.04";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2660,13 +2660,19 @@ static NSString *NDContainerCUID(void);
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.18.03\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendFormat:@"网解 10.18.04\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
     if (c.appsFlyerLastInstallDate > 0) {
         NSDate *afDate = [NSDate dateWithTimeIntervalSince1970:c.appsFlyerLastInstallDate];
         NSDateFormatter *fmt = [NSDateFormatter new];
         fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-        [r appendFormat:@"AppsFlyer 安装日期：%@\nAppsFlyer 重装次数：%ld\n\n",
+        int dateReads = atomic_load(&g_afDateReads);
+        int counterReads = atomic_load(&g_afCounterReads);
+        [r appendFormat:@"AppsFlyer 安装日期：%@\nAppsFlyer 重装次数：%ld\n",
             [fmt stringFromDate:afDate], (long)c.appsFlyerReinstallCounter];
+        [r appendFormat:@"AppsFlyer 钩子：%@\n", nd_o_afObjectForKey ? @"已装上" : @"没装上"];
+        [r appendFormat:@"安装日期读取：%d 次，返回 %@\n", dateReads, g_afLastDate ?: @"(还没读到)"];
+        [r appendFormat:@"重装次数读取：%d 次，返回 %@\n\n", counterReads, g_afLastCounter ?: @"(还没读到)"];
+        [r appendString:@"读法：次数大于 0，且返回值和上面两行一致，才是已经生效。\n\n"];
     } else {
         [r appendString:@"AppsFlyer 安装日期：未写入（先在管理器点一键随机）\n\n"];
     }
@@ -3048,6 +3054,10 @@ static void NDHookCuidClass(Class cls) {
 }
 static IMP nd_o_afObjectForKey = NULL;
 static IMP nd_o_afSetObject = NULL;
+static atomic_int g_afDateReads = 0;
+static atomic_int g_afCounterReads = 0;
+static NSString *g_afLastDate = nil;
+static NSString *g_afLastCounter = nil;
 
 static BOOL NDAppsFlyerKey(id key) {
     return [key isKindOfClass:NSString.class] &&
@@ -3069,7 +3079,16 @@ static id NDAppsFlyerValueForKey(NSString *key) {
 
 static id nd_af_objectForKey(id self, SEL _cmd, id key) {
     id replaced = NDAppsFlyerKey(key) ? NDAppsFlyerValueForKey(key) : nil;
-    if (replaced) return replaced;
+    if (replaced) {
+        if ([key isEqualToString:@"KCAppsFlyerLastInstallDate"]) {
+            atomic_fetch_add(&g_afDateReads, 1);
+            g_afLastDate = [replaced copy];
+        } else if ([key isEqualToString:@"KCAppsFlyerRICounter"]) {
+            atomic_fetch_add(&g_afCounterReads, 1);
+            g_afLastCounter = [replaced copy];
+        }
+        return replaced;
+    }
     if (nd_o_afObjectForKey) return ((id (*)(id, SEL, id))nd_o_afObjectForKey)(self, _cmd, key);
     return nil;
 }
