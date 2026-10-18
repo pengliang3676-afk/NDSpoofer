@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.18.05
+//  版本：10.18.06
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -2403,12 +2403,20 @@ static BOOL NDLoginUIVisible(void) {
     return NDVCHasLogin(root);
 }
 
+static CGRect NDFloatRestFrame(CGRect bounds) {
+    CGFloat size = 56.0;
+    CGFloat x = CGRectGetWidth(bounds) - size - 8.0;
+    CGFloat y = (CGRectGetHeight(bounds) - size) / 2.0;
+    if (y < 20.0) y = 20.0;
+    return CGRectMake(x, y, size, size);
+}
+
 static void NDFloatApplyDock(BOOL docked, BOOL animated) {
     if (!g_floatBtn) return;
     g_floatDocked = docked;
-    CGRect r = g_floatBtn.frame;
-    CGFloat peek = 16.0;
-    r.origin.x = docked ? (peek - r.size.width) : 8.0;
+    CGRect bounds = g_floatBtn.superview.bounds;
+    CGRect r = NDFloatRestFrame(bounds);
+    if (docked) r.origin.x = CGRectGetWidth(bounds) - 16.0;
     void (^go)(void) = ^{ g_floatBtn.frame = r; };
     if (animated) {
         [UIView animateWithDuration:0.28 delay:0
@@ -2550,7 +2558,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.18.05";
+    titleLbl.text = @"网解 10.18.06";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2666,7 +2674,7 @@ static IMP nd_o_afSetObject = NULL;
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.18.05\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendFormat:@"网解 10.18.06\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
     if (c.appsFlyerLastInstallDate > 0) {
         NSDate *afDate = [NSDate dateWithTimeIntervalSince1970:c.appsFlyerLastInstallDate];
         NSDateFormatter *fmt = [NSDateFormatter new];
@@ -2852,7 +2860,7 @@ static void NDEnsureFloatWindow(void) {
     win.rootViewController = root;
 
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.frame = CGRectMake(8, 120, 56, 56);
+    b.frame = NDFloatRestFrame(win.bounds);
     b.layer.cornerRadius = 28;
     b.layer.masksToBounds = YES;
     b.backgroundColor = [UIColor colorWithRed:0.10 green:0.55 blue:0.95 alpha:0.85];
@@ -2863,7 +2871,7 @@ static void NDEnsureFloatWindow(void) {
     [b addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
         NDFloatTapped();
     }] forControlEvents:UIControlEventTouchUpInside];
-    b.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
+    b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
     [root.view addSubview:b];
 
     g_floatWin = win;
@@ -2877,11 +2885,19 @@ static void NDSetupFloatButton(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             NDEnsureFloatWindow();
-            if (g_floatBtn) return;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                NDEnsureFloatWindow();
-            });
+            // 开屏广告通常盖几秒。广告窗口出来后再把球抬到最前。
+            for (int i = 1; i <= 4; i++) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 2 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    if (!g_floatWin) {
+                        NDEnsureFloatWindow();
+                        return;
+                    }
+                    g_floatWin.windowLevel = UIWindowLevelAlert + 1;
+                    g_floatWin.hidden = NO;
+                    if (g_floatBtn && !g_floatDocked) g_floatBtn.frame = NDFloatRestFrame(g_floatWin.bounds);
+                });
+            }
         });
     });
 }
