@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.18.02
+//  版本：10.18.03
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -178,6 +178,9 @@ static NSString * const NDConfigFileName = @"ndspoofer_config.plist";
 @property(nonatomic, assign) CGFloat screenScale;
 @property(nonatomic, copy) NSString *idfv;
 @property(nonatomic, copy) NSString *passSdkVersion;
+@property(nonatomic, assign) double appsFlyerLastInstallDate;
+@property(nonatomic, assign) NSInteger appsFlyerReinstallCounter;
+@property(nonatomic, assign) BOOL hasAppsFlyerReinstallCounter;
 // 真机基线（只读，用于字符串比对替换）
 @property(nonatomic, copy) NSString *realMachine;
 @property(nonatomic, copy) NSString *realModel;
@@ -274,6 +277,10 @@ static void NDLoadConfig(void) {
         c.screenScale        = NDCfgDouble(d, @"screenScale", 0);
         c.idfv             = NDCfgStr(d, @"idfv", @"");
         c.passSdkVersion   = NDCfgStr(d, @"passSdkVersion", @"9.8.12.20");
+        c.appsFlyerLastInstallDate = NDCfgDouble(d, @"appsFlyerLastInstallDate", 0);
+        id afCounter = d[@"appsFlyerReinstallCounter"];
+        c.hasAppsFlyerReinstallCounter = [afCounter isKindOfClass:NSNumber.class];
+        c.appsFlyerReinstallCounter = c.hasAppsFlyerReinstallCounter ? [afCounter integerValue] : 0;
 
         c.realMachine   = NDRealSysctlStr("hw.machine") ?: @"";
         c.realModel     = NDRealSysctlStr("hw.model") ?: @"";
@@ -2543,7 +2550,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.18.02";
+    titleLbl.text = @"网解 10.18.03";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2653,7 +2660,16 @@ static NSString *NDContainerCUID(void);
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.18.02\nUDID：%@\nCUID：%@\n\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendFormat:@"网解 10.18.03\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    if (c.appsFlyerLastInstallDate > 0) {
+        NSDate *afDate = [NSDate dateWithTimeIntervalSince1970:c.appsFlyerLastInstallDate];
+        NSDateFormatter *fmt = [NSDateFormatter new];
+        fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+        [r appendFormat:@"AppsFlyer 安装日期：%@\nAppsFlyer 重装次数：%ld\n\n",
+            [fmt stringFromDate:afDate], (long)c.appsFlyerReinstallCounter];
+    } else {
+        [r appendString:@"AppsFlyer 安装日期：未写入（先在管理器点一键随机）\n\n"];
+    }
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -3030,6 +3046,59 @@ static void NDHookCuidClass(Class cls) {
         NDHookOwnedCuidGetter(cls, sel, YES);
     }
 }
+static IMP nd_o_afObjectForKey = NULL;
+static IMP nd_o_afSetObject = NULL;
+
+static BOOL NDAppsFlyerKey(id key) {
+    return [key isKindOfClass:NSString.class] &&
+        ([key isEqualToString:@"KCAppsFlyerLastInstallDate"] ||
+         [key isEqualToString:@"KCAppsFlyerRICounter"]);
+}
+
+static id NDAppsFlyerValueForKey(NSString *key) {
+    NDConfig *c = NDCurrentConfig();
+    if (!c) return nil;
+    if ([key isEqualToString:@"KCAppsFlyerLastInstallDate"] && c.appsFlyerLastInstallDate > 0) {
+        return [NSString stringWithFormat:@"%.0f", c.appsFlyerLastInstallDate];
+    }
+    if ([key isEqualToString:@"KCAppsFlyerRICounter"] && c.hasAppsFlyerReinstallCounter) {
+        return [NSString stringWithFormat:@"%ld", (long)c.appsFlyerReinstallCounter];
+    }
+    return nil;
+}
+
+static id nd_af_objectForKey(id self, SEL _cmd, id key) {
+    id replaced = NDAppsFlyerKey(key) ? NDAppsFlyerValueForKey(key) : nil;
+    if (replaced) return replaced;
+    if (nd_o_afObjectForKey) return ((id (*)(id, SEL, id))nd_o_afObjectForKey)(self, _cmd, key);
+    return nil;
+}
+
+static void nd_af_setObject(id self, SEL _cmd, id value, id key) {
+    if (NDAppsFlyerKey(key)) return;
+    if (nd_o_afSetObject) ((void (*)(id, SEL, id, id))nd_o_afSetObject)(self, _cmd, value, key);
+}
+
+static void NDHookAppsFlyerKeychain(void) {
+    Class cls = objc_lookUpClass("AppsFlyerKeychainWrapper");
+    if (!cls) return;
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    for (unsigned int i = 0; i < count; i++) {
+        SEL sel = method_getName(methods[i]);
+        NSString *name = NSStringFromSelector(sel);
+        char ret[8] = {0};
+        method_getReturnType(methods[i], ret, sizeof(ret));
+        unsigned int args = method_getNumberOfArguments(methods[i]);
+        if ([name isEqualToString:@"objectForKey:"] && ret[0] == '@' && args == 3 && !nd_o_afObjectForKey) {
+            nd_o_afObjectForKey = method_setImplementation(methods[i], (IMP)nd_af_objectForKey);
+        } else if ([name isEqualToString:@"setObject:forKey:"] && ret[0] == 'v' && args == 4 && !nd_o_afSetObject) {
+            nd_o_afSetObject = method_setImplementation(methods[i], (IMP)nd_af_setObject);
+        }
+    }
+    free(methods);
+}
+
 static void NDInstallContainerIdentityPass(void) {
     static const char *classes[] = {"BaiduUDID", "BaiduMtjUDID", "BMKBaseUDID"};
     static const char *getters[] = {
@@ -3057,6 +3126,7 @@ static void NDInstallContainerIdentityPass(void) {
         free(all);
     }
     NDHookHiidoKeychain();
+    NDHookAppsFlyerKeychain();
     if (++g_ndIdentityTries < 20) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ NDInstallContainerIdentityPass(); });

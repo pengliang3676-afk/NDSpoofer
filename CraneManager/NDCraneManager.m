@@ -255,7 +255,7 @@ static NSDictionary *NDDefaultTemplate(void) {
 }
 
 // 一键随机：整套身份，所有开关一次开齐，同屏机型 + 独立 IDFV。
-static NSDictionary *NDRandomConfigForDevice(NSDictionary *existing, NSDictionary *device) {
+static NSDictionary *NDRandomConfigForDevice(NSDictionary *existing, NSDictionary *device, NSString *configPath) {
     NSDictionary *system = NDRandomSystemForDevice(device);
     NSArray *disks = device[@"disks"];
     NSNumber *disk = disks[arc4random_uniform((uint32_t)disks.count)];
@@ -269,6 +269,17 @@ static NSDictionary *NDRandomConfigForDevice(NSDictionary *existing, NSDictionar
     // 已有 IDFV 保留（容器内身份稳定）；没有则生成一套。
     if (![config[@"idfv"] isKindOfClass:NSString.class] || ![config[@"idfv"] length]) {
         config[@"idfv"] = NSUUID.UUID.UUIDString.uppercaseString;
+    }
+
+    // 新建容器还没有 AppsFlyer 安装记录时，日期用容器目录的创建时间，重装次数为 0。
+    // 已经写过的容器再点随机，不改这两项。
+    if (![config[@"appsFlyerLastInstallDate"] isKindOfClass:NSNumber.class] ||
+        [config[@"appsFlyerLastInstallDate"] doubleValue] <= 0) {
+        NSString *containerRoot = configPath.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
+        NSDate *birth = [NSFileManager.defaultManager attributesOfItemAtPath:containerRoot error:nil][NSFileCreationDate];
+        if (!birth) birth = NSDate.date;
+        config[@"appsFlyerLastInstallDate"] = @((long long)birth.timeIntervalSince1970);
+        config[@"appsFlyerReinstallCounter"] = @0;
     }
 
     [config addEntriesFromDictionary:@{
@@ -403,7 +414,7 @@ static void *NDLoadCraneLibrary(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"网解 10.18.02";
+    self.title = @"网解 10.18.03";
     self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
     self.selectedContainerIDs = [NSMutableSet set];
     self.tableView.rowHeight = 84.0;
@@ -665,7 +676,7 @@ static void *NDLoadCraneLibrary(void) {
         if (random) {
             // 每个容器独立抽一套，避免相邻容器同身份。
             NSDictionary *device = devices[arc4random_uniform((uint32_t)devices.count)];
-            config = NDRandomConfigForDevice(existing, device);
+            config = NDRandomConfigForDevice(existing, device, path);
             // 管理器展示用名（与 dylib 无关）
             NSMutableDictionary *m = config.mutableCopy;
             m[@"deviceProfileName"] = device[@"name"];
