@@ -256,6 +256,7 @@ static NSDictionary *NDDefaultTemplate(void) {
 
 // 一键随机：整套身份，所有开关一次开齐，同屏机型 + 独立 IDFV。
 static NSDictionary *NDRandomConfigForDevice(NSDictionary *existing, NSDictionary *device, NSString *configPath) {
+    (void)configPath;
     NSDictionary *system = NDRandomSystemForDevice(device);
     NSArray *disks = device[@"disks"];
     NSNumber *disk = disks[arc4random_uniform((uint32_t)disks.count)];
@@ -271,14 +272,12 @@ static NSDictionary *NDRandomConfigForDevice(NSDictionary *existing, NSDictionar
         config[@"idfv"] = NSUUID.UUID.UUIDString.uppercaseString;
     }
 
-    // 新建容器还没有 AppsFlyer 安装记录时，日期用容器目录的创建时间，重装次数为 0。
+    // 这个容器还没有 AppsFlyer 记录时，日期用这次一键随机的时间，重装次数为 0。
+    // Crane 新建容器会带上模板文件夹的旧创建时间，不能用那个时间。
     // 已经写过的容器再点随机，不改这两项。
     if (![config[@"appsFlyerLastInstallDate"] isKindOfClass:NSNumber.class] ||
         [config[@"appsFlyerLastInstallDate"] doubleValue] <= 0) {
-        NSString *containerRoot = configPath.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
-        NSDate *birth = [NSFileManager.defaultManager attributesOfItemAtPath:containerRoot error:nil][NSFileCreationDate];
-        if (!birth) birth = NSDate.date;
-        config[@"appsFlyerLastInstallDate"] = @((long long)birth.timeIntervalSince1970);
+        config[@"appsFlyerLastInstallDate"] = @((long long)NSDate.date.timeIntervalSince1970);
         config[@"appsFlyerReinstallCounter"] = @0;
     }
 
