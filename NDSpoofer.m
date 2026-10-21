@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.21.04
+//  版本：10.21.05
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -1578,6 +1578,97 @@ static void NDNoteLoginReport(NSURLRequest *req) {
     NDNoteLoginLine(line);
 }
 
+static IMP nd_o_setUrl = NULL;
+static IMP nd_o_setUrlReq = NULL;
+static IMP nd_o_initURLBase = NULL;
+static IMP nd_o_initURLNorm = NULL;
+static IMP nd_o_sapiPost4 = NULL;
+static IMP nd_o_sapiPost5 = NULL;
+static IMP nd_o_sapiPostPath = NULL;
+
+static void NDNoteURLObject(id url) {
+    if ([url isKindOfClass:NSString.class]) {
+        NSString *low = [(NSString *)url lowercaseString];
+        if ([low containsString:@"historylist"] || [low containsString:@"getonlineapp"]) return;
+        if ([low containsString:@"passport"] || [low containsString:@"wappass"] ||
+            [low containsString:@"login"] || [low containsString:@"/device"] ||
+            [low containsString:@"auth"] || [low containsString:@"security"])
+            NDNoteLoginLine([NSString stringWithFormat:@"POST %@", url]);
+    } else if ([url isKindOfClass:NSURLRequest.class]) {
+        NDNoteLoginReport(url);
+    } else if ([url isKindOfClass:NSURL.class]) {
+        NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:url];
+        r.HTTPMethod = @"POST";
+        NDNoteLoginReport(r);
+    }
+}
+
+static void nd_hook_setUrl(id self, SEL _cmd, id url) {
+    NDNoteURLObject(url);
+    if (nd_o_setUrl) ((void (*)(id, SEL, id))nd_o_setUrl)(self, _cmd, url);
+}
+static void nd_hook_setUrlReq(id self, SEL _cmd, id req) {
+    NDNoteURLObject(req);
+    if (nd_o_setUrlReq) ((void (*)(id, SEL, id))nd_o_setUrlReq)(self, _cmd, req);
+}
+static id nd_hook_initURLBase(id self, SEL _cmd, id req) {
+    NDNoteURLObject(req);
+    if (nd_o_initURLBase) return ((id (*)(id, SEL, id))nd_o_initURLBase)(self, _cmd, req);
+    return nil;
+}
+static id nd_hook_initURLNorm(id self, SEL _cmd, id req) {
+    NDNoteURLObject(req);
+    if (nd_o_initURLNorm) return ((id (*)(id, SEL, id))nd_o_initURLNorm)(self, _cmd, req);
+    return nil;
+}
+static id nd_hook_sapiPost4(id self, SEL _cmd, id req, id done) {
+    NDNoteURLObject(req);
+    if (nd_o_sapiPost4) return ((id (*)(id, SEL, id, id))nd_o_sapiPost4)(self, _cmd, req, done);
+    return nil;
+}
+static id nd_hook_sapiPost5(id self, SEL _cmd, id req, id ok, id fail) {
+    NDNoteURLObject(req);
+    if (nd_o_sapiPost5) return ((id (*)(id, SEL, id, id, id))nd_o_sapiPost5)(self, _cmd, req, ok, fail);
+    return nil;
+}
+static void nd_hook_sapiPostPath(id self, SEL _cmd, id path, id params, id ok, id fail) {
+    NDNoteURLObject(path);
+    if (nd_o_sapiPostPath)
+        ((void (*)(id, SEL, id, id, id, id))nd_o_sapiPostPath)(self, _cmd, path, params, ok, fail);
+}
+
+static BOOL NDEncIs(Method m, const char *enc) {
+    const char *t = m ? method_getTypeEncoding(m) : NULL;
+    return t && enc && strcmp(t, enc) == 0;
+}
+
+static void NDSwapOwned(Class cls, const char *selName, const char *enc, IMP repl, IMP *slot) {
+    if (!cls || *slot) return;
+    Method m = class_getInstanceMethod(cls, sel_registerName(selName));
+    if (!m || !NDEncIs(m, enc)) return;
+    Class supercls = class_getSuperclass(cls);
+    if (supercls && class_getInstanceMethod(supercls, sel_registerName(selName)) == m) return;
+    *slot = method_setImplementation(m, repl);
+}
+
+static void NDInstallLoginWatch(void) {
+    NDSwapOwned(objc_lookUpClass("BBANormalAPIRequest"), "setUrl:", "v24@0:8@16",
+                (IMP)nd_hook_setUrl, &nd_o_setUrl);
+    NDSwapOwned(objc_lookUpClass("BBABaseAPIRequest"), "setUrlRequest:", "v24@0:8@16",
+                (IMP)nd_hook_setUrlReq, &nd_o_setUrlReq);
+    NDSwapOwned(objc_lookUpClass("BBABaseAPIRequest"), "initWithURLRequest:", "@24@0:8@16",
+                (IMP)nd_hook_initURLBase, &nd_o_initURLBase);
+    NDSwapOwned(objc_lookUpClass("BBANormalAPIRequest"), "initWithURLRequest:", "@24@0:8@16",
+                (IMP)nd_hook_initURLNorm, &nd_o_initURLNorm);
+    Class sapi = objc_lookUpClass("SAPIHTTPClient");
+    NDSwapOwned(sapi, "postWithRequest:completionHandler:", "@32@0:8@16@?24",
+                (IMP)nd_hook_sapiPost4, &nd_o_sapiPost4);
+    NDSwapOwned(sapi, "postWithRequest:success:failure:", "@40@0:8@16@?24@?32",
+                (IMP)nd_hook_sapiPost5, &nd_o_sapiPost5);
+    NDSwapOwned(sapi, "postPath:parameters:success:failure:", "v48@0:8@16@24@?32@?40",
+                (IMP)nd_hook_sapiPostPath, &nd_o_sapiPostPath);
+}
+
 static void NDNotePassReq(NSString *via, NSURLRequest *req) {
     if (![req isKindOfClass:NSURLRequest.class] || !req.URL) return;
     if (!NDURLLooksPass(req.URL) && !NDURLNeedsDVIF(req.URL)) return;
@@ -1905,6 +1996,7 @@ static void NDInstallAll(void) {
     NDInstallOne(@"EBAppLogDeviceHelper", NSSelectorFromString(@"resolutionString"), YES,
                  '@', 0, "", (IMP)nd_hook_ebResolutionString, &nd_o_ebResolutionString);
     NDInstallEBResolution();
+    NDInstallLoginWatch();
 }
 
 static volatile int g_ndDrainQueued = 0;
@@ -2669,7 +2761,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.21.04";
+    titleLbl.text = @"网解 10.21.05";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2787,7 +2879,7 @@ static IMP nd_o_afSetTime = NULL;
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.21.04\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendFormat:@"网解 10.21.05\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
     [r appendString:@"\n—— 和上次打开比 ——\n"];
     [r appendString:g_diDiff ?: @"这次还没生成设备包。用一会儿再点一次悬浮球。\n"];
     [r appendString:@"\n—— 这次打开的登录上报 ——\n"];
