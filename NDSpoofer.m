@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.21.01
+//  版本：10.21.02
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -1532,9 +1532,42 @@ static BOOL NDURLLooksPass(NSURL *u) {
     return NO;
 }
 
+static NSMutableArray<NSString *> *g_loginPosts = nil;
+
+static BOOL NDURLLooksLoginReport(NSURL *u) {
+    NSString *p = (u.path ?: @"").lowercaseString;
+    if ([p containsString:@"historylist"] || [p containsString:@"getonlineapp"]) return NO;
+    if ([p containsString:@"login"] || [p containsString:@"/v3/api/device/"] ||
+        [p containsString:@"auth"] || [p containsString:@"devinfo"]) return YES;
+    return NO;
+}
+
+static void NDNoteLoginReport(NSURLRequest *req) {
+    if (![req isKindOfClass:NSURLRequest.class] || !NDURLLooksLoginReport(req.URL)) return;
+    NSString *method = req.HTTPMethod.length ? req.HTTPMethod : @"GET";
+    NSMutableString *line = [NSMutableString stringWithFormat:@"%@ %@", method, NDShortPassURL(req.URL)];
+    NSData *body = req.HTTPBody;
+    if (body.length > 0 && body.length < 200000) {
+        NSString *s = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+        if (!s.length) s = [[NSString alloc] initWithData:body encoding:NSASCIIStringEncoding];
+        NSMutableArray<NSString *> *hit = [NSMutableArray array];
+        for (NSString *k in @[@"di", @"cuid", @"clientid", @"devuid", @"zid"]) {
+            if ([s containsString:k]) [hit addObject:k];
+        }
+        if (hit.count) [line appendFormat:@" 含%@", [hit componentsJoinedByString:@"、"]];
+    }
+    if (!g_loginPosts) g_loginPosts = [NSMutableArray array];
+    @synchronized (g_loginPosts) {
+        if ([g_loginPosts containsObject:line]) return;
+        [g_loginPosts addObject:line];
+        if (g_loginPosts.count > 20) [g_loginPosts removeObjectAtIndex:0];
+    }
+}
+
 static void NDNotePassReq(NSString *via, NSURLRequest *req) {
     if (![req isKindOfClass:NSURLRequest.class] || !req.URL) return;
     if (!NDURLLooksPass(req.URL) && !NDURLNeedsDVIF(req.URL)) return;
+    NDNoteLoginReport(req);
     NSString *s = NDShortPassURL(req.URL);
     if (s.length) g_h5LastURL = [s copy];
     BOOL dv = NDRequestHasDVIF(req);
@@ -2622,7 +2655,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.21.01";
+    titleLbl.text = @"网解 10.21.02";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2740,9 +2773,18 @@ static IMP nd_o_afSetTime = NULL;
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.21.01\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendFormat:@"网解 10.21.02\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
     [r appendString:@"\n—— 和上次打开比 ——\n"];
     [r appendString:g_diDiff ?: @"这次还没生成设备包。用一会儿再点一次悬浮球。\n"];
+    [r appendString:@"\n—— 这次打开的登录上报 ——\n"];
+    if (!g_loginPosts.count) {
+        [r appendString:@"还没看到。完全退出网盘再打开，进首页后再点悬浮球。\n"];
+    } else {
+        @synchronized (g_loginPosts) {
+            for (NSString *line in g_loginPosts) [r appendFormat:@"%@\n", line];
+        }
+    }
+    [r appendString:@"看 POST。那一行就是打开时发出去的登录上报。\n"];
     if (c.appsFlyerLastInstallDate > 0) {
         NSDate *afDate = [NSDate dateWithTimeIntervalSince1970:c.appsFlyerLastInstallDate];
         NSDateFormatter *fmt = [NSDateFormatter new];
