@@ -14,11 +14,11 @@ jobs:
         run: bash scripts/build_release_xcode.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: NDSpoofer-10.21.02
+          name: NDSpoofer-10.21.03
           path: |
-            dist/M-10.21.02.dylib
-            dist/X-10.21.02.deb
-            dist/NDSpoofer_10.21.02.dylib
-            dist/NDSpooferCraneManager_10.21.02_RootHide.deb
+            dist/M-10.21.03.dylib
+            dist/X-10.21.03.deb
+            dist/NDSpoofer_10.21.03.dylib
+            dist/NDSpooferCraneManager_10.21.03_RootHide.deb
             dist/ndspoofer_config.plist
             dist/SHA256SUMS.txt
