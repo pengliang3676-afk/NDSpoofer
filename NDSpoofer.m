@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.20.01
+//  版本：10.21.01
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -547,6 +547,66 @@ static int g_plainN = 0, g_plainCnt = 0, g_plainSohN = 0;
 static NSString *g_plainPM = nil, *g_plainVer = nil;
 static NSString *g_plainRam = nil, *g_plainDsk = nil;
 static NSArray<NSString *> *g_plainAll = nil;
+static NSString *g_diDiff = nil;
+
+static NSString *NDDiFieldName(NSUInteger i) {
+    switch (i) {
+        case 3: return @"PhoneModel";
+        case 4: return @"SystemVersion";
+        case 6: return @"CUID";
+        case 20: return @"ram";
+        case 21: return @"disk";
+        case 22: return @"freeDisk";
+        case 26: return @"ip";
+        default: return nil;
+    }
+}
+
+static NSString *NDDiShort(NSString *v) {
+    if (![v isKindOfClass:NSString.class] || !v.length) return @"(空)";
+    if (v.length > 48) return [[v substringToIndex:48] stringByAppendingString:@"…"];
+    return v;
+}
+
+static void NDSnapshotDiFields(NSArray<NSString *> *fields) {
+    if (g_diDiff || fields.count < 22) return;
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/nd_di_fields.plist"];
+    NSString *timePath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/nd_di_fields_time.txt"];
+    NSArray *prev = [NSArray arrayWithContentsOfFile:path];
+    NSString *prevTime = [[NSString stringWithContentsOfFile:timePath encoding:NSUTF8StringEncoding error:nil]
+        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSMutableString *diff = [NSMutableString string];
+    if (![prev isKindOfClass:NSArray.class] || !prev.count) {
+        [diff appendString:@"还没有上一次的设备包。这次已记下，再打开一次就能对照。\n"];
+    } else {
+        NSUInteger n = MAX(prev.count, fields.count);
+        int changed = 0, shown = 0;
+        for (NSUInteger i = 0; i < n; i++) {
+            NSString *a = (i < prev.count && [prev[i] isKindOfClass:NSString.class]) ? prev[i] : @"";
+            NSString *b = (i < fields.count && [fields[i] isKindOfClass:NSString.class]) ? fields[i] : @"";
+            if ([a isEqualToString:b]) continue;
+            changed++;
+            if (shown >= 30) continue;
+            shown++;
+            NSString *name = NDDiFieldName(i);
+            if (name.length)
+                [diff appendFormat:@"[%lu] %@\n  上次 %@\n  这次 %@\n",
+                    (unsigned long)i, name, NDDiShort(a), NDDiShort(b)];
+            else
+                [diff appendFormat:@"[%lu]\n  上次 %@\n  这次 %@\n",
+                    (unsigned long)i, NDDiShort(a), NDDiShort(b)];
+        }
+        if (!changed)
+            [diff appendFormat:@"和上次（%@）相比，字段没有变化。\n", prevTime.length ? prevTime : @"时间未知"];
+        else
+            [diff appendFormat:@"和上次（%@）相比，变了 %d 项。\n", prevTime.length ? prevTime : @"时间未知", changed];
+    }
+    g_diDiff = [diff copy];
+    [fields writeToFile:path atomically:YES];
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    [[fmt stringFromDate:NSDate.date] writeToFile:timePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
 
 static void NDNoteSapiPlainFields(NSString *s) {
     g_plainN++;
@@ -561,6 +621,7 @@ static void NDNoteSapiPlainFields(NSString *s) {
     g_plainVer = f.count > 4 ? [f[4] copy] : nil;
     g_plainRam = f.count > 20 ? [f[20] copy] : nil;
     g_plainDsk = f.count > 21 ? [f[21] copy] : nil;
+    NDSnapshotDiFields(f);
 }
 
 // ============================== NSUserDefaults 出口收口（NADSplash / sofire / UA 缓存） ==============================
@@ -2561,7 +2622,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.20.01";
+    titleLbl.text = @"网解 10.21.01";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2679,7 +2740,9 @@ static IMP nd_o_afSetTime = NULL;
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.20.01\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendFormat:@"网解 10.21.01\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendString:@"\n—— 和上次打开比 ——\n"];
+    [r appendString:g_diDiff ?: @"这次还没生成设备包。用一会儿再点一次悬浮球。\n"];
     if (c.appsFlyerLastInstallDate > 0) {
         NSDate *afDate = [NSDate dateWithTimeIntervalSince1970:c.appsFlyerLastInstallDate];
         NSDateFormatter *fmt = [NSDateFormatter new];
