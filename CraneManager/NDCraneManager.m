@@ -254,6 +254,16 @@ static NSDictionary *NDDefaultTemplate(void) {
     return p ? [NSDictionary dictionaryWithContentsOfFile:p] : nil;
 }
 
+// 剩余量在「至少 8GB」和「总容量减去 10GB」之间抽一次。
+static unsigned long long NDRandomFreeBytes(unsigned long long total) {
+    unsigned long long floorFree = 8ULL * 1024ULL * 1024ULL * 1024ULL;
+    unsigned long long keepUsed = 10ULL * 1024ULL * 1024ULL * 1024ULL;
+    if (total <= floorFree + keepUsed) return total / 2;
+    unsigned long long spanKB = (total - floorFree - keepUsed) / 1024ULL;
+    if (spanKB > 0xFFFFFFFFULL) spanKB = 0xFFFFFFFFULL;
+    return floorFree + (unsigned long long)arc4random_uniform((uint32_t)spanKB) * 1024ULL;
+}
+
 // 一键随机：整套身份，所有开关一次开齐，同屏机型 + 独立 IDFV。
 static NSDictionary *NDRandomConfigForDevice(NSDictionary *existing, NSDictionary *device, NSString *configPath) {
     NSDictionary *system = NDRandomSystemForDevice(device);
@@ -288,6 +298,13 @@ static NSDictionary *NDRandomConfigForDevice(NSDictionary *existing, NSDictionar
     NSString *countPath = [[configPath stringByDeletingLastPathComponent]
         stringByAppendingPathComponent:@"nd_open_count.txt"];
     [@"1" writeToFile:countPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    unsigned long long totalBytes = disk.unsignedLongLongValue * 1024ULL * 1024ULL * 1024ULL;
+    unsigned long long freeBytes = NDRandomFreeBytes(totalBytes);
+    config[@"freeDiskBytes"] = @(freeBytes);
+    NSString *freePath = [[configPath stringByDeletingLastPathComponent]
+        stringByAppendingPathComponent:@"nd_free_disk.txt"];
+    [[NSString stringWithFormat:@"%llu", freeBytes] writeToFile:freePath atomically:YES
+                                                      encoding:NSUTF8StringEncoding error:nil];
 
     [config addEntriesFromDictionary:@{
         @"configVersion": @1,
@@ -421,7 +438,7 @@ static void *NDLoadCraneLibrary(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"网解 10.22.07";
+    self.title = @"网解 10.22.08";
     self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
     self.selectedContainerIDs = [NSMutableSet set];
     self.tableView.rowHeight = 84.0;

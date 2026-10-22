@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.22.07
+//  版本：10.22.08
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -172,6 +172,7 @@ static NSString * const NDConfigFileName = @"ndspoofer_config.plist";
 @property(nonatomic, copy) NSString *kernHostname;
 @property(nonatomic, assign) NSInteger memorySizeMB;
 @property(nonatomic, assign) NSInteger diskSizeGB;
+@property(nonatomic, assign) uint64_t freeDiskBytes;
 @property(nonatomic, assign) CGFloat screenWidth;
 @property(nonatomic, assign) CGFloat screenHeight;
 @property(nonatomic, assign) CGFloat nativeScreenWidth;
@@ -214,6 +215,10 @@ static NSInteger NDCfgInt(NSDictionary *d, NSString *key, NSInteger def) {
     id v = d[key];
     return [v isKindOfClass:NSNumber.class] ? [v integerValue] : def;
 }
+static long long NDCfgLong(NSDictionary *d, NSString *key, long long def) {
+    id v = d[key];
+    return [v isKindOfClass:NSNumber.class] ? [v longLongValue] : def;
+}
 static double NDCfgDouble(NSDictionary *d, NSString *key, double def) {
     id v = d[key];
     return [v isKindOfClass:NSNumber.class] ? [v doubleValue] : def;
@@ -239,6 +244,46 @@ static uint64_t NDRealDiskBytes(void) {
         if (statfs("/", &s) != 0) return 0;
     }
     return (uint64_t)s.f_bsize * (uint64_t)s.f_blocks;
+}
+
+// 剩余量在「至少 8GB」和「总容量减去 10GB」之间抽一次。不跟真机当前剩余绑在一起。
+static uint64_t NDRandomFreeBytes(uint64_t total) {
+    uint64_t floorFree = 8ULL * 1024ULL * 1024ULL * 1024ULL;
+    uint64_t keepUsed = 10ULL * 1024ULL * 1024ULL * 1024ULL;
+    if (total <= floorFree + keepUsed) return total / 2;
+    uint64_t spanKB = (total - floorFree - keepUsed) / 1024ULL;
+    if (spanKB > 0xFFFFFFFFULL) spanKB = 0xFFFFFFFFULL;
+    return floorFree + (uint64_t)arc4random_uniform((uint32_t)spanKB) * 1024ULL;
+}
+
+static uint64_t NDContainerFreeBytes(NDConfig *c) {
+    static uint64_t cached = 0;
+    static BOOL ready = NO;
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    if (!c || c.diskSizeGB <= 0) return 0;
+    uint64_t total = (uint64_t)c.diskSizeGB * 1024ULL * 1024ULL * 1024ULL;
+    os_unfair_lock_lock(&lock);
+    if (ready) {
+        uint64_t v = cached;
+        os_unfair_lock_unlock(&lock);
+        return v;
+    }
+    uint64_t v = c.freeDiskBytes;
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/nd_free_disk.txt"];
+    if (v <= (8ULL << 30) || v >= total) {
+        NSString *saved = [[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (saved.length) v = (uint64_t)saved.longLongValue;
+    }
+    if (v <= (8ULL << 30) || v >= total) {
+        v = NDRandomFreeBytes(total);
+        [[NSString stringWithFormat:@"%llu", v] writeToFile:path atomically:YES
+                                                   encoding:NSUTF8StringEncoding error:nil];
+    }
+    cached = v;
+    ready = YES;
+    os_unfair_lock_unlock(&lock);
+    return v;
 }
 
 static NDConfig *NDCurrentConfig(void) {
@@ -272,6 +317,7 @@ static void NDLoadConfig(void) {
         c.kernHostname     = NDCfgStr(d, @"kernHostname", @"");
         c.memorySizeMB     = NDCfgInt(d, @"memorySize", 0);
         c.diskSizeGB       = NDCfgInt(d, @"diskSize", 0);
+        c.freeDiskBytes    = (uint64_t)NDCfgLong(d, @"freeDiskBytes", 0);
         c.screenWidth        = NDCfgDouble(d, @"screenWidth", 0);
         c.screenHeight       = NDCfgDouble(d, @"screenHeight", 0);
         c.nativeScreenWidth  = NDCfgDouble(d, @"nativeScreenWidth", 0);
@@ -390,11 +436,11 @@ static int nd_statfs(const char *path, struct statfs *buf) {
     uint64_t total = bsize * (uint64_t)buf->f_blocks;
     if (total < (10ULL * 1024 * 1024 * 1024)) return r;
     uint64_t fakeTotal = (uint64_t)c.diskSizeGB * 1024ULL * 1024ULL * 1024ULL;
-    if (fakeTotal == total) return r;
-    uint64_t availBytes = bsize * (uint64_t)buf->f_bavail;
+    uint64_t fakeFree = NDContainerFreeBytes(c);
+    if (fakeFree == 0 || fakeFree >= fakeTotal) return r;
     uint64_t newBlocks = fakeTotal / bsize;
-    uint64_t newAvail  = availBytes / bsize;
-    if (newBlocks <= newAvail) return r;              // 装不下真实空闲量就不动，保证不出现负数
+    uint64_t newAvail  = fakeFree / bsize;
+    if (newBlocks <= newAvail || newBlocks == 0) return r;
     buf->f_blocks = (fsblkcnt_t)newBlocks;
     buf->f_bfree  = (fsblkcnt_t)newAvail;
     buf->f_bavail = (fsblkcnt_t)newAvail;
@@ -580,17 +626,13 @@ static NSString *NDRewriteSapiPlain(NSString *s, NDConfig *c) {
         if (f[21].longLongValue != want)
             f[21] = [NSString stringWithFormat:@"%lld", want];
     }
-    if (f.count > 22 && c.diskSizeGB > 0 && c.realDiskBytes > 0 &&
+    if (f.count > 22 && c.diskSizeGB > 0 &&
         [f[22] rangeOfString:@"^\\d+$" options:NSRegularExpressionSearch].location != NSNotFound) {
-        long long v = f[22].longLongValue;
-        long long realKB = (long long)(c.realDiskBytes / 1024ULL);
+        uint64_t freeB = NDContainerFreeBytes(c);
         long long fakeKB = (long long)c.diskSizeGB * 1024LL * 1024LL;
-        if (v > 0 && realKB > 0 && v <= realKB && fakeKB > realKB) {
-            long long outv = v * fakeKB / realKB;
-            if (outv < 1) outv = 1;
-            if (outv >= fakeKB) outv = fakeKB - fakeKB / 20;
+        long long outv = (long long)(freeB / 1024ULL);
+        if (outv > 0 && outv < fakeKB)
             f[22] = [NSString stringWithFormat:@"%lld", outv];
-        }
     }
     if (f.count > 26 && f[26].length &&
         ([f[26] containsString:@":"] || [f[26] containsString:@"."]))
@@ -1097,37 +1139,22 @@ static BOOL nd_hook_sapiNotAllowedDI(id self, SEL _cmd, unsigned long long idx) 
 }
 
 // 把 SAPI 返回的容量值按 fake/real 缩放，保持原类型（NSString / NSNumber）和单位。
-static id NDScaleSapiBytes(id orig, uint64_t fakeBytes, uint64_t realBytes, BOOL isFree) {
-    if (!orig || fakeBytes == 0 || realBytes == 0 || fakeBytes == realBytes) return orig;
+static id nd_hook_sapiFreeDisk(id self, SEL _cmd) {
+    id orig = nd_o_sapiFreeDisk ? ((id (*)(id, SEL))nd_o_sapiFreeDisk)(self, _cmd) : nil;
+    NDConfig *c = NDCurrentConfig();
+    if (!c.enabled || !c.spoofStorage || c.diskSizeGB <= 0) return orig;
+    uint64_t total = (uint64_t)c.diskSizeGB * 1024ULL * 1024ULL * 1024ULL;
+    uint64_t freeB = NDContainerFreeBytes(c);
+    if (!orig || freeB == 0 || freeB >= total) return orig;
     BOOL isStr = [orig isKindOfClass:NSString.class];
     BOOL isNum = [orig isKindOfClass:NSNumber.class];
     if (!isStr && !isNum) return orig;
     long long v = isStr ? ((NSString *)orig).longLongValue : ((NSNumber *)orig).longLongValue;
     if (v <= 0) return orig;
-    long long fake, real;
-    if (v > (long long)(realBytes / 512ULL)) {
-        fake = (long long)fakeBytes;
-        real = (long long)realBytes;
-    } else {
-        fake = (long long)(fakeBytes / 1024ULL);
-        real = (long long)(realBytes / 1024ULL);
-    }
-    if (real <= 0) return orig;
-    long long outv = isFree ? (v * fake / real) : fake;
-    if (isFree) {
-        if (outv < 1) outv = 1;
-        if (fake > 1 && outv >= fake) outv = fake - 1;
-    }
+    long long outv = (v > (long long)(total / 512ULL)) ? (long long)freeB : (long long)(freeB / 1024ULL);
+    if (outv < 1) return orig;
     if (isStr) return [NSString stringWithFormat:@"%lld", outv];
     return @(outv);
-}
-
-static id nd_hook_sapiFreeDisk(id self, SEL _cmd) {
-    id orig = nd_o_sapiFreeDisk ? ((id (*)(id, SEL))nd_o_sapiFreeDisk)(self, _cmd) : nil;
-    NDConfig *c = NDCurrentConfig();
-    if (!c.enabled || !c.spoofStorage || c.diskSizeGB <= 0 || c.realDiskBytes == 0) return orig;
-    uint64_t fake = (uint64_t)c.diskSizeGB * 1024ULL * 1024ULL * 1024ULL;
-    return NDScaleSapiBytes(orig, fake, c.realDiskBytes, YES);
 }
 static id nd_hook_sapiLocalIP(id self, SEL _cmd) {
     NDConfig *c = NDCurrentConfig();
@@ -3042,7 +3069,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.22.07";
+    titleLbl.text = @"网解 10.22.08";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -3160,7 +3187,7 @@ static IMP nd_o_afSetTime = NULL;
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.22.07\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendFormat:@"网解 10.22.08\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
     {
         NSTimeInterval boot = NDContainerBootTime(c);
         NSDateFormatter *bootFmt = [NSDateFormatter new];
@@ -3209,9 +3236,10 @@ static void NDShowReport(void) {
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
         c.spoofUA ? @"开" : @"关", c.spoofIDFV ? @"开" : @"关", c.spoofStorage ? @"开" : @"关",
         c.spoofScreen ? @"开" : @"关", c.seedPassCustom ? @"开" : @"关"];
-    [r appendFormat:@"\n伪装机型：%@ (%@)\n营销名：%@\n伪装系统：%@ (%@)\n内存：%ldMB\n磁盘：%ldGB\n配置屏幕：%.0fx%.0f @%.0fx / 物理%.0fx%.0f\n",
+    [r appendFormat:@"\n伪装机型：%@ (%@)\n营销名：%@\n伪装系统：%@ (%@)\n内存：%ldMB\n磁盘：%ldGB，剩余 %.1fGB\n配置屏幕：%.0fx%.0f @%.0fx / 物理%.0fx%.0f\n",
         c.hwMachine, c.hwModel, c.marketingName, c.systemVersion, c.systemBuild,
         (long)c.memorySizeMB, (long)c.diskSizeGB,
+        (double)NDContainerFreeBytes(c) / (1024.0 * 1024.0 * 1024.0),
         c.screenWidth, c.screenHeight, c.screenScale,
         c.nativeScreenWidth, c.nativeScreenHeight];
     [r appendFormat:@"\n真机机型：%@ (%@)\n真机系统：%@ (%@)\n真机内存：%lluMB\n真机磁盘：%lluGB\n",
@@ -3316,9 +3344,10 @@ static void NDShowReport(void) {
     [r appendFormat:@"[4] SystemVersion：%@\n", g_plainVer ?: @"(无)"];
     [r appendFormat:@"[20] ram(KB)：%@\n", g_plainRam ?: @"(无)"];
     [r appendFormat:@"[21] disk(KB)：%@\n", g_plainDsk ?: @"(无)"];
-    [r appendFormat:@"配置内存：%ldMB  磁盘：%ldGB  CPU：%@\n",
-        (long)c.memorySizeMB, (long)c.diskSizeGB, c.cpuBrand ?: @"-"];
-    [r appendString:@"[22] 应随伪装磁盘放大，[26] 应空（不要再是 fe80）。下面是全部字段。\n"];
+    [r appendFormat:@"配置内存：%ldMB  磁盘：%ldGB，剩余 %.1fGB  CPU：%@\n",
+        (long)c.memorySizeMB, (long)c.diskSizeGB,
+        (double)NDContainerFreeBytes(c) / (1024.0 * 1024.0 * 1024.0), c.cpuBrand ?: @"-"];
+    [r appendString:@"[22] 是这个容器自己抽的剩余，同一档容量也会不一样。[26] 应空。下面是全部字段。\n"];
     if (g_plainAll.count) {
         NSUInteger n = MIN((NSUInteger)g_plainAll.count, (NSUInteger)48);
         for (NSUInteger i = 0; i < n; i++) {
