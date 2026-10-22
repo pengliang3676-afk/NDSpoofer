@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.21.05
+//  版本：10.22.01
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -2761,7 +2761,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.21.05";
+    titleLbl.text = @"网解 10.22.01";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2871,6 +2871,7 @@ static atomic_int g_afDateReads = 0;
 static atomic_int g_afCounterReads = 0;
 static NSString *g_afLastDate = nil;
 static NSString *g_afLastCounter = nil;
+static NSString *g_devuidLine = nil;
 static IMP nd_o_afStringForKey = NULL;
 static IMP nd_o_afTimeForKey = NULL;
 static IMP nd_o_afSetString = NULL;
@@ -2879,7 +2880,7 @@ static IMP nd_o_afSetTime = NULL;
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.21.05\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendFormat:@"网解 10.22.01\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
     [r appendString:@"\n—— 和上次打开比 ——\n"];
     [r appendString:g_diDiff ?: @"这次还没生成设备包。用一会儿再点一次悬浮球。\n"];
     [r appendString:@"\n—— 这次打开的登录上报 ——\n"];
@@ -2891,6 +2892,8 @@ static void NDShowReport(void) {
         }
     }
     [r appendString:@"下面是这次打开网盘发出的 POST。从中找登录、设备、上报这几类地址。\n"];
+    [r appendString:@"\n—— devuid ——\n"];
+    [r appendString:g_devuidLine ?: @"这次还没读到 devuid。进首页后再点一次悬浮球。\n"];
     if (c.appsFlyerLastInstallDate > 0) {
         NSDate *afDate = [NSDate dateWithTimeIntervalSince1970:c.appsFlyerLastInstallDate];
         NSDateFormatter *fmt = [NSDateFormatter new];
@@ -3473,6 +3476,72 @@ static BOOL NDShouldRun(void) {
     return YES;
 }
 
+static NSMapTable *g_devuidOrig = nil;
+
+static NSString *NDDevuidShort(NSString *v) {
+    if (![v isKindOfClass:NSString.class] || !v.length) return @"(空)";
+    if (v.length > 48) return [[v substringToIndex:48] stringByAppendingString:@"…"];
+    return v;
+}
+
+static void NDNoteDevuid(NSString *value) {
+    if (g_devuidLine.length || value.length < 4) return;
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/nd_devuid.txt"];
+    NSString *prev = [[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]
+        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!prev.length) {
+        g_devuidLine = [[NSString stringWithFormat:@"%@\n这次已记下，再打开一次就能对照。\n", NDDevuidShort(value)] copy];
+    } else if ([prev isEqualToString:value]) {
+        g_devuidLine = [[NSString stringWithFormat:@"没变：%@\n", NDDevuidShort(value)] copy];
+    } else {
+        g_devuidLine = [[NSString stringWithFormat:@"变了\n  上次 %@\n  这次 %@\n",
+            NDDevuidShort(prev), NDDevuidShort(value)] copy];
+    }
+    [value writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static id nd_hook_devuid(id self, SEL _cmd) {
+    IMP orig = NULL;
+    @synchronized (g_devuidOrig) {
+        for (Class cls = [self class]; cls; cls = class_getSuperclass(cls)) {
+            orig = (IMP)NSMapTableGet(g_devuidOrig, (__bridge const void *)cls);
+            if (orig) break;
+        }
+    }
+    id value = orig ? ((id (*)(id, SEL))orig)(self, _cmd) : nil;
+    if ([value isKindOfClass:NSString.class]) NDNoteDevuid(value);
+    return value;
+}
+
+static void NDInstallDevuidWatch(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        static const char *names[] = {"currentDevuid", "passDevuid", "devuid"};
+        g_devuidOrig = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsOpaqueMemory | NSPointerFunctionsOpaquePersonality
+                                             valueOptions:NSPointerFunctionsOpaqueMemory];
+        unsigned int count = 0;
+        Class *list = objc_copyClassList(&count);
+        if (!list) return;
+        for (unsigned int i = 0; i < count; i++) {
+            Class cls = list[i];
+            for (size_t n = 0; n < sizeof(names) / sizeof(names[0]); n++) {
+                SEL sel = sel_registerName(names[n]);
+                Method m = class_getInstanceMethod(cls, sel);
+                if (!m) continue;
+                Class sup = class_getSuperclass(cls);
+                if (sup && class_getInstanceMethod(sup, sel) == m) continue;
+                const char *enc = method_getTypeEncoding(m);
+                if (!enc || strcmp(enc, "@16@0:8") != 0) continue;
+                IMP orig = method_setImplementation(m, (IMP)nd_hook_devuid);
+                @synchronized (g_devuidOrig) {
+                    NSMapTableSet(g_devuidOrig, (__bridge const void *)cls, orig);
+                }
+            }
+        }
+        free(list);
+    });
+}
+
 __attribute__((constructor))
 static void nd_constructor(void) {
     @autoreleasepool {
@@ -3498,5 +3567,6 @@ static void nd_constructor(void) {
         }];
         NSLog(@"[NDSpoofer] loaded profile=%@ (%@) iOS %@",
               c.hwMachine, c.hwModel, c.systemVersion);
+        NDInstallDevuidWatch();
     }
 }
