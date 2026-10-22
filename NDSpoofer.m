@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.22.08
+//  版本：10.22.09
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -246,7 +246,8 @@ static uint64_t NDRealDiskBytes(void) {
     return (uint64_t)s.f_bsize * (uint64_t)s.f_blocks;
 }
 
-// 剩余量在「至少 8GB」和「总容量减去 10GB」之间抽一次。不跟真机当前剩余绑在一起。
+// 每个容器有自己的剩余基准，落在「至少 8GB」到「总容量减 10GB」之间。
+// 基准不变。每次打开在基准上浮动 0.2～2.5GB，同一次打开里多次读取是同一个数。
 static uint64_t NDRandomFreeBytes(uint64_t total) {
     uint64_t floorFree = 8ULL * 1024ULL * 1024ULL * 1024ULL;
     uint64_t keepUsed = 10ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -254,6 +255,22 @@ static uint64_t NDRandomFreeBytes(uint64_t total) {
     uint64_t spanKB = (total - floorFree - keepUsed) / 1024ULL;
     if (spanKB > 0xFFFFFFFFULL) spanKB = 0xFFFFFFFFULL;
     return floorFree + (uint64_t)arc4random_uniform((uint32_t)spanKB) * 1024ULL;
+}
+
+static uint64_t NDDriftFreeBytes(uint64_t anchor, uint64_t total) {
+    uint64_t floorFree = 8ULL * 1024ULL * 1024ULL * 1024ULL;
+    uint64_t ceiling = total > (10ULL << 30) ? total - (10ULL << 30) : total * 9 / 10;
+    uint64_t step = (200ULL + arc4random_uniform(2301)) * 1024ULL * 1024ULL;
+    step += (uint64_t)arc4random_uniform(8192) * 1024ULL;
+    uint64_t up = anchor + step;
+    uint64_t down = anchor > step ? anchor - step : floorFree;
+    uint64_t v = arc4random_uniform(2) == 0 ? down : up;
+    if (v < floorFree) v = up;
+    if (v > ceiling) v = down;
+    if (v < floorFree) v = floorFree;
+    if (v > ceiling) v = ceiling;
+    if (v == anchor && anchor > (1024ULL * 1024ULL)) v = anchor - (1024ULL * 1024ULL);
+    return v;
 }
 
 static uint64_t NDContainerFreeBytes(NDConfig *c) {
@@ -268,22 +285,22 @@ static uint64_t NDContainerFreeBytes(NDConfig *c) {
         os_unfair_lock_unlock(&lock);
         return v;
     }
-    uint64_t v = c.freeDiskBytes;
+    uint64_t anchor = c.freeDiskBytes;
     NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/nd_free_disk.txt"];
-    if (v <= (8ULL << 30) || v >= total) {
+    if (anchor <= (8ULL << 30) || anchor >= total) {
         NSString *saved = [[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]
             stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if (saved.length) v = (uint64_t)saved.longLongValue;
+        if (saved.length) anchor = (uint64_t)saved.longLongValue;
     }
-    if (v <= (8ULL << 30) || v >= total) {
-        v = NDRandomFreeBytes(total);
-        [[NSString stringWithFormat:@"%llu", v] writeToFile:path atomically:YES
-                                                   encoding:NSUTF8StringEncoding error:nil];
+    if (anchor <= (8ULL << 30) || anchor >= total) {
+        anchor = NDRandomFreeBytes(total);
+        [[NSString stringWithFormat:@"%llu", anchor] writeToFile:path atomically:YES
+                                                        encoding:NSUTF8StringEncoding error:nil];
     }
-    cached = v;
+    cached = NDDriftFreeBytes(anchor, total);
     ready = YES;
     os_unfair_lock_unlock(&lock);
-    return v;
+    return cached;
 }
 
 static NDConfig *NDCurrentConfig(void) {
@@ -3069,7 +3086,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.22.08";
+    titleLbl.text = @"网解 10.22.09";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -3187,7 +3204,7 @@ static IMP nd_o_afSetTime = NULL;
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.22.08\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendFormat:@"网解 10.22.09\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
     {
         NSTimeInterval boot = NDContainerBootTime(c);
         NSDateFormatter *bootFmt = [NSDateFormatter new];
@@ -3347,7 +3364,7 @@ static void NDShowReport(void) {
     [r appendFormat:@"配置内存：%ldMB  磁盘：%ldGB，剩余 %.1fGB  CPU：%@\n",
         (long)c.memorySizeMB, (long)c.diskSizeGB,
         (double)NDContainerFreeBytes(c) / (1024.0 * 1024.0 * 1024.0), c.cpuBrand ?: @"-"];
-    [r appendString:@"[22] 是这个容器自己抽的剩余，同一档容量也会不一样。[26] 应空。下面是全部字段。\n"];
+    [r appendString:@"[22] 是这个容器自己的剩余，每次打开浮动一点，同一次打开不变。[26] 应空。下面是全部字段。\n"];
     if (g_plainAll.count) {
         NSUInteger n = MIN((NSUInteger)g_plainAll.count, (NSUInteger)48);
         for (NSUInteger i = 0; i < n; i++) {
