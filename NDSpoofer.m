@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.22.10
+//  版本：10.22.11
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -3087,7 +3087,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.22.10";
+    titleLbl.text = @"网解 10.22.11";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -3201,11 +3201,13 @@ static IMP nd_o_afStringForKey = NULL;
 static IMP nd_o_afTimeForKey = NULL;
 static IMP nd_o_afSetString = NULL;
 static IMP nd_o_afSetTime = NULL;
+static IMP nd_o_afDataForKey = NULL;
+static IMP nd_o_afSetData = NULL;
 
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.22.10\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendFormat:@"网解 10.22.11\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
     {
         NSTimeInterval boot = NDContainerBootTime(c);
         NSDateFormatter *bootFmt = [NSDateFormatter new];
@@ -3661,19 +3663,20 @@ static id nd_hiido_getUserData(id self, SEL _cmd, id key) {
     if (nd_o_hiidoGetUserData) return ((id (*)(id, SEL, id))nd_o_hiidoGetUserData)(self, _cmd, key);
     return nil;
 }
-static void nd_hiido_setUserData(id self, SEL _cmd, id key, id data) {
+static BOOL nd_hiido_setUserData(id self, SEL _cmd, id key, id data) {
     if (NDIsHiidoUDIDKey(key)) {
         NDSaveHiidoUDID(data);
-        return;
+        return YES;
     }
-    if (nd_o_hiidoSetUserData) ((void (*)(id, SEL, id, id))nd_o_hiidoSetUserData)(self, _cmd, key, data);
+    if (nd_o_hiidoSetUserData) return ((BOOL (*)(id, SEL, id, id))nd_o_hiidoSetUserData)(self, _cmd, key, data);
+    return NO;
 }
 static void NDHookHiidoUDID(void) {
     Class cls = objc_lookUpClass("HDANA_EcryptHelper");
     if (!cls) return;
-    Class meta = object_getClass(cls);
-    BOOL got = NDReplaceOwnedMethod(meta, "getUserData:", (IMP)nd_hiido_getUserData, &nd_o_hiidoGetUserData, '@', 3);
-    BOOL set = NDReplaceOwnedMethod(meta, "setUserData:data:", (IMP)nd_hiido_setUserData, &nd_o_hiidoSetUserData, 'v', 4);
+    // 13.35 里这两个是实例方法。setUserData:data: 返回 BOOL，不是 void。
+    BOOL got = NDReplaceOwnedMethod(cls, "getUserData:", (IMP)nd_hiido_getUserData, &nd_o_hiidoGetUserData, '@', 3);
+    BOOL set = NDReplaceOwnedMethod(cls, "setUserData:data:", (IMP)nd_hiido_setUserData, &nd_o_hiidoSetUserData, 'B', 4);
     if (got && set) g_hiidoUDIDHooked = YES;
 }
 
@@ -3731,6 +3734,32 @@ static void NDHookCuidClass(Class cls) {
 static BOOL g_afDateCommitted = NO;
 static double g_afSavedDate = 0;
 static BOOL g_afLocalSeen = NO;
+static BOOL g_afHadDateAtLaunch = NO;
+static BOOL g_afLaunchNoted = NO;
+
+static void NDClearStaleAppsFlyerDefaults(void) {
+    NSArray *keys = @[
+        @"AppsFlyerInstallTimestamp", @"AppsFlyerInstallDate", @"AppsFlyerFirstLaunchDate",
+        @"AppsFlyerFirstLaunchTimestamp", @"AppsFlyerReInstallCounter",
+        @"AppsFlyerCurrentLastInstallDate", @"AppsFlyerInitDate",
+        @"AppsFlyerCounter", @"AppsFlyerRealLaunchCounter", @"AppsFlyerUserId"
+    ];
+    NSMutableArray *stores = [NSMutableArray arrayWithObject:NSUserDefaults.standardUserDefaults];
+    NSUserDefaults *suite = [[NSUserDefaults alloc] initWithSuiteName:@"AppsFlyerPreferences"];
+    if (suite) [stores addObject:suite];
+    for (NSUserDefaults *store in stores) {
+        for (NSString *key in keys) [store removeObjectForKey:key];
+    }
+}
+
+static void NDNoteAppsFlyerLaunchState(void) {
+    if (g_afLaunchNoted) return;
+    g_afLaunchNoted = YES;
+    NDConfig *c = NDCurrentConfig();
+    g_afHadDateAtLaunch = c && c.appsFlyerLastInstallDate > 1000000000;
+    // 这个容器还没有自己的安装日期时，清掉模板带过来的旧记录，避免被当成重装。
+    if (!g_afHadDateAtLaunch) NDClearStaleAppsFlyerDefaults();
+}
 
 static BOOL NDAppsFlyerKey(id key) {
     return [key isKindOfClass:NSString.class] &&
@@ -3842,23 +3871,21 @@ static double nd_af_timeIntervalForKey(id self, SEL _cmd, id key) {
 }
 
 static void NDAcceptAppsFlyerWrite(id key, id value, double timeValue, BOOL hasTime) {
+    NDNoteAppsFlyerLaunchState();
+    if (g_afHadDateAtLaunch) return;
     if ([key isEqualToString:@"KCAppsFlyerLastInstallDate"]) {
         double t = hasTime ? timeValue : NDParseAppsFlyerDate(value);
-        if (t > 1000000000) {
-            g_afSavedDate = t;
-            g_afDateCommitted = YES;
-            g_afLocalSeen = YES;
-            NDPersistAppsFlyer(@"appsFlyerLastInstallDate", @(t));
-        }
+        double now = NSDate.date.timeIntervalSince1970;
+        if (t < now - 3 * 3600 || t > now + 600) t = now;
+        g_afSavedDate = t;
+        g_afDateCommitted = YES;
+        g_afLocalSeen = YES;
+        NDPersistAppsFlyer(@"appsFlyerLastInstallDate", @(t));
+        NDPersistAppsFlyer(@"appsFlyerReinstallCounter", @0);
         return;
     }
     if ([key isEqualToString:@"KCAppsFlyerRICounter"]) {
-        NSInteger n = 0;
-        if (hasTime) n = (NSInteger)timeValue;
-        else if ([value isKindOfClass:NSNumber.class]) n = ((NSNumber *)value).integerValue;
-        else if ([value isKindOfClass:NSString.class]) n = ((NSString *)value).integerValue;
-        if (n < 0) n = 0;
-        NDPersistAppsFlyer(@"appsFlyerReinstallCounter", @(n));
+        NDPersistAppsFlyer(@"appsFlyerReinstallCounter", @0);
     }
 }
 
@@ -3880,6 +3907,48 @@ static BOOL nd_af_setTime(id self, SEL _cmd, double value, id key) {
     return NO;
 }
 
+static id nd_af_dataForKey(id self, SEL _cmd, id key) {
+    if (NDAppsFlyerKey(key)) {
+        id replaced = NDAppsFlyerValueForKey(key);
+        NDAppsFlyerNoteRead(key, replaced ?: @"空");
+        if (![replaced isKindOfClass:NSString.class]) return nil;
+        return [(NSString *)replaced dataUsingEncoding:NSUTF8StringEncoding];
+    }
+    if (nd_o_afDataForKey) return ((id (*)(id, SEL, id))nd_o_afDataForKey)(self, _cmd, key);
+    return nil;
+}
+
+static BOOL nd_af_setData(id self, SEL _cmd, id data, id key) {
+    if (NDAppsFlyerKey(key)) {
+        id parsed = nil;
+        double timeValue = 0;
+        BOOL hasTime = NO;
+        if ([data isKindOfClass:NSData.class]) {
+            NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (s.length) parsed = s;
+            else {
+                NSSet *classes = [NSSet setWithObjects:NSDate.class, NSNumber.class, NSString.class, nil];
+                id obj = [NSKeyedUnarchiver unarchivedObjectOfClasses:classes fromData:data error:nil];
+                if ([obj isKindOfClass:NSDate.class]) {
+                    timeValue = [(NSDate *)obj timeIntervalSince1970];
+                    hasTime = YES;
+                } else if ([obj isKindOfClass:NSNumber.class]) {
+                    timeValue = [(NSNumber *)obj doubleValue];
+                    hasTime = YES;
+                } else if ([obj isKindOfClass:NSString.class]) {
+                    parsed = obj;
+                }
+            }
+        } else if ([data isKindOfClass:NSString.class] || [data isKindOfClass:NSNumber.class]) {
+            parsed = data;
+        }
+        NDAcceptAppsFlyerWrite(key, parsed, timeValue, hasTime);
+        return YES;
+    }
+    if (nd_o_afSetData) return ((BOOL (*)(id, SEL, id, id))nd_o_afSetData)(self, _cmd, data, key);
+    return NO;
+}
+
 static BOOL NDReplaceOwnedMethod(Class cls, const char *selName, IMP repl, IMP *slot, char expectRet, unsigned expectArgs) {
     if (!cls || !slot || *slot) return slot && *slot;
     SEL sel = sel_registerName(selName);
@@ -3895,14 +3964,16 @@ static BOOL NDReplaceOwnedMethod(Class cls, const char *selName, IMP repl, IMP *
 }
 
 static void NDHookAppsFlyerKeychain(void) {
-    if (nd_o_afStringForKey && nd_o_afTimeForKey && nd_o_afSetString && nd_o_afSetTime) return;
+    if (nd_o_afStringForKey && nd_o_afTimeForKey && nd_o_afSetString && nd_o_afSetTime &&
+        nd_o_afDataForKey && nd_o_afSetData) return;
     Class cls = objc_lookUpClass("AppsFlyerKeychainWrapper");
     if (!cls) return;
-    // 13.35.2 的 AppsFlyerKeychainWrapper 用 stringForKey: / timeIntervalForKey:。
     NDReplaceOwnedMethod(cls, "stringForKey:", (IMP)nd_af_stringForKey, &nd_o_afStringForKey, '@', 3);
     NDReplaceOwnedMethod(cls, "timeIntervalForKey:", (IMP)nd_af_timeIntervalForKey, &nd_o_afTimeForKey, 'd', 3);
     NDReplaceOwnedMethod(cls, "setString:forKey:", (IMP)nd_af_setString, &nd_o_afSetString, 'B', 4);
     NDReplaceOwnedMethod(cls, "setTimeInterval:forKey:", (IMP)nd_af_setTime, &nd_o_afSetTime, 'B', 4);
+    NDReplaceOwnedMethod(cls, "dataForKey:", (IMP)nd_af_dataForKey, &nd_o_afDataForKey, '@', 3);
+    NDReplaceOwnedMethod(cls, "setData:forKey:", (IMP)nd_af_setData, &nd_o_afSetData, 'B', 4);
 }
 
 static void NDInstallContainerIdentityPass(void) {
@@ -3955,6 +4026,7 @@ static void nd_constructor(void) {
     @autoreleasepool {
         if (!NDShouldRun()) return;
         NDLoadConfig();
+        NDNoteAppsFlyerLaunchState();
         NDHookAppsFlyerKeychain();
         NDHookHiidoUDID();
         NDSetupFloatButton();
