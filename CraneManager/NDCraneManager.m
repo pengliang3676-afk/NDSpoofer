@@ -280,6 +280,12 @@ static NSDictionary *NDRandomConfigForDevice(NSDictionary *existing, NSDictionar
         config[@"appsFlyerLastInstallDate"] = @((long long)NSDate.date.timeIntervalSince1970);
         config[@"appsFlyerReinstallCounter"] = @0;
     }
+    {
+        uint32_t days = 3 + arc4random_uniform(40);
+        uint32_t extra = arc4random_uniform(86400);
+        NSTimeInterval boot = NSDate.date.timeIntervalSince1970 - (days * 86400.0) - extra;
+        config[@"bootTime"] = @((long long)boot);
+    }
 
     [config addEntriesFromDictionary:@{
         @"configVersion": @1,
@@ -413,7 +419,7 @@ static void *NDLoadCraneLibrary(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"网解 10.22.05";
+    self.title = @"网解 10.22.06";
     self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
     self.selectedContainerIDs = [NSMutableSet set];
     self.tableView.rowHeight = 84.0;

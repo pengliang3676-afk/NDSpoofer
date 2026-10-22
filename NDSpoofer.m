@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.22.05
+//  版本：10.22.06
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -182,6 +182,7 @@ static NSString * const NDConfigFileName = @"ndspoofer_config.plist";
 @property(nonatomic, assign) double appsFlyerLastInstallDate;
 @property(nonatomic, assign) NSInteger appsFlyerReinstallCounter;
 @property(nonatomic, assign) BOOL hasAppsFlyerReinstallCounter;
+@property(nonatomic, assign) double containerBootTime;
 // 真机基线（只读，用于字符串比对替换）
 @property(nonatomic, copy) NSString *realMachine;
 @property(nonatomic, copy) NSString *realModel;
@@ -279,6 +280,7 @@ static void NDLoadConfig(void) {
         c.idfv             = NDCfgStr(d, @"idfv", @"");
         c.passSdkVersion   = NDCfgStr(d, @"passSdkVersion", @"9.8.12.20");
         c.appsFlyerLastInstallDate = NDCfgDouble(d, @"appsFlyerLastInstallDate", 0);
+        c.containerBootTime = NDCfgDouble(d, @"bootTime", 0);
         id afCounter = d[@"appsFlyerReinstallCounter"];
         c.hasAppsFlyerReinstallCounter = [afCounter isKindOfClass:NSNumber.class];
         c.appsFlyerReinstallCounter = c.hasAppsFlyerReinstallCounter ? [afCounter integerValue] : 0;
@@ -513,6 +515,31 @@ static NSString *NDRewriteDeviceInfoLine(NSString *s, NDConfig *c) {
 
 // SAPI 明文设备串以 \x01（SOH）分隔。运行时：[3] PhoneModel [4] SystemVersion
 // [20] ram(KB) [21] disk(KB) [22] freeDisk [26] localIP。[14] 是 false，不是 CPU。
+static NSTimeInterval NDRandomBootTimestamp(void) {
+    uint32_t days = 3 + arc4random_uniform(40);
+    uint32_t extra = arc4random_uniform(86400);
+    return floor(NSDate.date.timeIntervalSince1970 - (days * 86400.0) - extra);
+}
+
+static NSTimeInterval NDContainerBootTime(NDConfig *c) {
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    if (c.containerBootTime > 1000000000 && c.containerBootTime < now)
+        return c.containerBootTime;
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/nd_boot_time.txt"];
+    NSString *saved = [[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]
+        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    double savedBoot = saved.doubleValue;
+    if (savedBoot > 1000000000 && savedBoot < now) {
+        c.containerBootTime = savedBoot;
+        return savedBoot;
+    }
+    double fresh = NDRandomBootTimestamp();
+    c.containerBootTime = fresh;
+    [[NSString stringWithFormat:@"%.0f", fresh] writeToFile:path atomically:YES
+                                                   encoding:NSUTF8StringEncoding error:nil];
+    return fresh;
+}
+
 static NSString *NDRewriteSapiPlain(NSString *s, NDConfig *c) {
     if (![s isKindOfClass:NSString.class] || !s.length) return s;
     NSString *sep = @"\x01";
@@ -540,6 +567,12 @@ static NSString *NDRewriteSapiPlain(NSString *s, NDConfig *c) {
     if (f.count > 26 && f[26].length &&
         ([f[26] containsString:@":"] || [f[26] containsString:@"."]))
         f[26] = @"";
+    if (f.count > 23) {
+        NSTimeInterval boot = NDContainerBootTime(c);
+        long long up = (long long)(NSDate.date.timeIntervalSince1970 - boot);
+        if (up < 120) up = 120;
+        f[23] = [NSString stringWithFormat:@"%lld", up];
+    }
     return [f componentsJoinedByString:sep];
 }
 
@@ -2978,7 +3011,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.22.05";
+    titleLbl.text = @"网解 10.22.06";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -3096,7 +3129,13 @@ static IMP nd_o_afSetTime = NULL;
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.22.05\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendFormat:@"网解 10.22.06\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    {
+        NSTimeInterval boot = NDContainerBootTime(c);
+        NSDateFormatter *bootFmt = [NSDateFormatter new];
+        bootFmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+        [r appendFormat:@"容器开机：%@\n", [bootFmt stringFromDate:[NSDate dateWithTimeIntervalSince1970:boot]]];
+    }
     [r appendString:@"\n—— 和上次打开比 ——\n"];
     [r appendString:g_diDiff ?: @"这次还没生成设备包。用一会儿再点一次悬浮球。\n"];
     [r appendString:@"\n—— 这次打开的登录上报 ——\n"];
