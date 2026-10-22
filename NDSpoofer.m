@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.22.03
+//  版本：10.22.05
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -1596,6 +1596,20 @@ static void NDNoteSdkRequest(NSURLRequest *req) {
     NDNoteSdk(s);
 }
 
+static void NDNoteSdkBody(NSData *data) {
+    if (!data.length || [g_sdkLine containsString:@"body："]) return;
+    NSMutableString *s = [NSMutableString string];
+    if (data.length < 100000) {
+        NSString *b = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (b.length > 360) b = [[b substringToIndex:360] stringByAppendingString:@"…"];
+        [s appendFormat:@"body：%@\n", b.length ? b : [NSString stringWithFormat:@"%lu字节", (unsigned long)data.length]];
+    } else {
+        [s appendFormat:@"body：%lu字节\n", (unsigned long)data.length];
+    }
+    NDNoteSdk(s);
+    NDHarvestDevuid([[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]);
+}
+
 static void NDNoteSdkResponse(NSData *data) {
     if ([g_sdkLine containsString:@"返回"]) return;
     NSMutableString *s = [NSMutableString stringWithString:@"返回\n"];
@@ -1741,20 +1755,44 @@ static void NDNoteURLObject(id url) {
     }
 }
 
+static const char kNDReqURLKey;
+
+static NSString *NDURLText(id url) {
+    if ([url isKindOfClass:NSString.class]) return url;
+    if ([url isKindOfClass:NSURL.class]) return [(NSURL *)url absoluteString];
+    if ([url isKindOfClass:NSURLRequest.class]) return [(NSURLRequest *)url URL].absoluteString;
+    return nil;
+}
+
+static void NDRememberURL(id obj, id url) {
+    NSString *s = NDURLText(url);
+    if (obj && s.length)
+        objc_setAssociatedObject(obj, &kNDReqURLKey, s, OBJC_ASSOCIATION_COPY_NONATOMIC);
+}
+
+static BOOL NDSelfIsSdkInit(id obj) {
+    NSString *s = objc_getAssociatedObject(obj, &kNDReqURLKey);
+    return [s.lowercaseString containsString:@"sdkconfig/init"];
+}
+
 static void nd_hook_setUrl(id self, SEL _cmd, id url) {
+    NDRememberURL(self, url);
     NDNoteURLObject(url);
     if (nd_o_setUrl) ((void (*)(id, SEL, id))nd_o_setUrl)(self, _cmd, url);
 }
 static void nd_hook_setUrlReq(id self, SEL _cmd, id req) {
+    NDRememberURL(self, req);
     NDNoteURLObject(req);
     if (nd_o_setUrlReq) ((void (*)(id, SEL, id))nd_o_setUrlReq)(self, _cmd, req);
 }
 static id nd_hook_initURLBase(id self, SEL _cmd, id req) {
+    NDRememberURL(self, req);
     NDNoteURLObject(req);
     if (nd_o_initURLBase) return ((id (*)(id, SEL, id))nd_o_initURLBase)(self, _cmd, req);
     return nil;
 }
 static id nd_hook_initURLNorm(id self, SEL _cmd, id req) {
+    NDRememberURL(self, req);
     NDNoteURLObject(req);
     if (nd_o_initURLNorm) return ((id (*)(id, SEL, id))nd_o_initURLNorm)(self, _cmd, req);
     return nil;
@@ -1773,6 +1811,32 @@ static void nd_hook_sapiPostPath(id self, SEL _cmd, id path, id params, id ok, i
     NDNoteURLObject(path);
     if (nd_o_sapiPostPath)
         ((void (*)(id, SEL, id, id, id, id))nd_o_sapiPostPath)(self, _cmd, path, params, ok, fail);
+}
+
+static IMP nd_o_setBody = NULL;
+static IMP nd_o_setRespData = NULL;
+static IMP nd_o_setRespStr = NULL;
+static IMP nd_o_setRespJSON = NULL;
+
+static void nd_hook_setBody(id self, SEL _cmd, id data) {
+    if (NDSelfIsSdkInit(self) && [data isKindOfClass:NSData.class]) NDNoteSdkBody(data);
+    if (nd_o_setBody) ((void (*)(id, SEL, id))nd_o_setBody)(self, _cmd, data);
+}
+static void nd_hook_setRespData(id self, SEL _cmd, id data) {
+    if (NDSelfIsSdkInit(self) && [data isKindOfClass:NSData.class]) NDNoteSdkResponse(data);
+    if (nd_o_setRespData) ((void (*)(id, SEL, id))nd_o_setRespData)(self, _cmd, data);
+}
+static void nd_hook_setRespStr(id self, SEL _cmd, id text) {
+    if (NDSelfIsSdkInit(self) && [text isKindOfClass:NSString.class])
+        NDNoteSdkResponse([(NSString *)text dataUsingEncoding:NSUTF8StringEncoding]);
+    if (nd_o_setRespStr) ((void (*)(id, SEL, id))nd_o_setRespStr)(self, _cmd, text);
+}
+static void nd_hook_setRespJSON(id self, SEL _cmd, id obj) {
+    if (NDSelfIsSdkInit(self) && [obj isKindOfClass:NSDictionary.class]) {
+        NSData *data = [NSJSONSerialization dataWithJSONObject:obj options:0 error:nil];
+        if (data) NDNoteSdkResponse(data);
+    }
+    if (nd_o_setRespJSON) ((void (*)(id, SEL, id))nd_o_setRespJSON)(self, _cmd, obj);
 }
 
 static BOOL NDEncIs(Method m, const char *enc) {
@@ -1805,6 +1869,11 @@ static void NDInstallLoginWatch(void) {
                 (IMP)nd_hook_sapiPost5, &nd_o_sapiPost5);
     NDSwapOwned(sapi, "postPath:parameters:success:failure:", "v48@0:8@16@24@?32@?40",
                 (IMP)nd_hook_sapiPostPath, &nd_o_sapiPostPath);
+    Class bba = objc_lookUpClass("BBABaseAPIRequest");
+    NDSwapOwned(bba, "setPostBodyData:", "v24@0:8@16", (IMP)nd_hook_setBody, &nd_o_setBody);
+    NDSwapOwned(bba, "setResponseData:", "v24@0:8@16", (IMP)nd_hook_setRespData, &nd_o_setRespData);
+    NDSwapOwned(bba, "setResponseString:", "v24@0:8@16", (IMP)nd_hook_setRespStr, &nd_o_setRespStr);
+    NDSwapOwned(bba, "setResponseJSON:", "v24@0:8@16", (IMP)nd_hook_setRespJSON, &nd_o_setRespJSON);
 }
 
 static void NDNotePassReq(NSString *via, NSURLRequest *req) {
@@ -2907,7 +2976,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.22.03";
+    titleLbl.text = @"网解 10.22.05";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -3025,7 +3094,7 @@ static IMP nd_o_afSetTime = NULL;
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.22.03\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendFormat:@"网解 10.22.05\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
     [r appendString:@"\n—— 和上次打开比 ——\n"];
     [r appendString:g_diDiff ?: @"这次还没生成设备包。用一会儿再点一次悬浮球。\n"];
     [r appendString:@"\n—— 这次打开的登录上报 ——\n"];
