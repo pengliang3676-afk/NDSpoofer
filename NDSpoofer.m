@@ -2893,6 +2893,7 @@ static void NDSeedPassCustom(NDConfig *c) {
 
 static UIButton *g_floatBtn = nil;
 static UIWindow *g_floatWin = nil;
+static BOOL g_hiidoUDIDHooked = NO;
 static BOOL g_floatDocked = NO;
 static BOOL g_floatDockTimerOn = NO;
 static BOOL g_floatLoginOK = NO;
@@ -3248,7 +3249,7 @@ static void NDShowReport(void) {
     } else {
         [r appendString:@"AppsFlyer 安装日期：未写入（这个容器第一次打开后才会有）\n\n"];
     }
-    [r appendFormat:@"海度设备号：%@\n", nd_o_hiidoGetUserData ? @"按容器分开" : @"钩子没装上"];
+    [r appendFormat:@"海度设备号：%@\n", g_hiidoUDIDHooked ? @"按容器分开" : @"钩子没装上"];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -3671,8 +3672,9 @@ static void NDHookHiidoUDID(void) {
     Class cls = objc_lookUpClass("HDANA_EcryptHelper");
     if (!cls) return;
     Class meta = object_getClass(cls);
-    NDReplaceOwnedMethod(meta, "getUserData:", (IMP)nd_hiido_getUserData, &nd_o_hiidoGetUserData, '@', 3);
-    NDReplaceOwnedMethod(meta, "setUserData:data:", (IMP)nd_hiido_setUserData, &nd_o_hiidoSetUserData, 'v', 4);
+    BOOL got = NDReplaceOwnedMethod(meta, "getUserData:", (IMP)nd_hiido_getUserData, &nd_o_hiidoGetUserData, '@', 3);
+    BOOL set = NDReplaceOwnedMethod(meta, "setUserData:data:", (IMP)nd_hiido_setUserData, &nd_o_hiidoSetUserData, 'v', 4);
+    if (got && set) g_hiidoUDIDHooked = YES;
 }
 
 static BOOL NDHookHiidoKeychain(void) {
