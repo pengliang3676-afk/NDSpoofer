@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.22.02
+//  版本：10.22.03
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -1533,6 +1533,56 @@ static BOOL NDURLLooksPass(NSURL *u) {
 }
 
 static NSMutableArray<NSString *> *g_loginPosts = nil;
+static NSString *g_devuidLine = nil;
+
+static NSString *NDFormValue(NSString *s, NSString *key) {
+    if (![s isKindOfClass:NSString.class] || !s.length || !key.length) return nil;
+    NSString *pat = [key stringByAppendingString:@"="];
+    NSRange r = [s rangeOfString:pat options:NSCaseInsensitiveSearch];
+    if (r.location == NSNotFound) return nil;
+    NSUInteger i = NSMaxRange(r);
+    NSUInteger end = i;
+    while (end < s.length) {
+        unichar c = [s characterAtIndex:end];
+        if (c == '&' || c == ' ' || c == '"' || c == '\'' || c == '\n' || c == '\r') break;
+        end++;
+    }
+    if (end <= i) return nil;
+    NSString *v = [s substringWithRange:NSMakeRange(i, end - i)];
+    return [v stringByRemovingPercentEncoding] ?: v;
+}
+
+static NSString *NDDevuidShort(NSString *v) {
+    if (v.length > 48) return [[v substringToIndex:48] stringByAppendingString:@"…"];
+    return v;
+}
+
+static void NDNoteDevuidValue(NSString *value) {
+    if (g_devuidLine.length || value.length < 4) return;
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/nd_devuid.txt"];
+    NSString *prev = [[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]
+        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!prev.length) {
+        g_devuidLine = [[NSString stringWithFormat:@"%@\n这次已记下，再打开一次就能对照。\n", NDDevuidShort(value)] copy];
+    } else if ([prev isEqualToString:value]) {
+        g_devuidLine = [[NSString stringWithFormat:@"没变：%@\n", NDDevuidShort(value)] copy];
+    } else {
+        g_devuidLine = [[NSString stringWithFormat:@"变了\n  上次 %@\n  这次 %@\n",
+            NDDevuidShort(prev), NDDevuidShort(value)] copy];
+    }
+    [value writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static void NDHarvestDevuid(NSString *blob) {
+    if (!blob.length) return;
+    for (NSString *k in @[@"devuid", @"pdevuid", @"device_id", @"deviceid"]) {
+        NSString *v = NDFormValue(blob, k);
+        if (v.length >= 4) {
+            NDNoteDevuidValue(v);
+            return;
+        }
+    }
+}
 
 static BOOL NDURLLooksLoginReport(NSURL *u) {
     if (!u) return NO;
@@ -1574,7 +1624,10 @@ static void NDNoteLoginReport(NSURLRequest *req) {
             if ([s containsString:k]) [hit addObject:k];
         }
         if (hit.count) [line appendFormat:@" 含%@", [hit componentsJoinedByString:@"、"]];
+        NDHarvestDevuid(s);
     }
+    NDHarvestDevuid(req.URL.absoluteString);
+    NDHarvestDevuid(req.URL.query);
     NDNoteLoginLine(line);
 }
 
@@ -1592,8 +1645,10 @@ static void NDNoteURLObject(id url) {
         if ([low containsString:@"historylist"] || [low containsString:@"getonlineapp"]) return;
         if ([low containsString:@"passport"] || [low containsString:@"wappass"] ||
             [low containsString:@"login"] || [low containsString:@"/device"] ||
-            [low containsString:@"auth"] || [low containsString:@"security"])
+            [low containsString:@"auth"] || [low containsString:@"security"]) {
             NDNoteLoginLine([NSString stringWithFormat:@"POST %@", url]);
+            NDHarvestDevuid(url);
+        }
     } else if ([url isKindOfClass:NSURLRequest.class]) {
         NDNoteLoginReport(url);
     } else if ([url isKindOfClass:NSURL.class]) {
@@ -2761,7 +2816,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.22.02";
+    titleLbl.text = @"网解 10.22.03";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2879,7 +2934,7 @@ static IMP nd_o_afSetTime = NULL;
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.22.02\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendFormat:@"网解 10.22.03\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
     [r appendString:@"\n—— 和上次打开比 ——\n"];
     [r appendString:g_diDiff ?: @"这次还没生成设备包。用一会儿再点一次悬浮球。\n"];
     [r appendString:@"\n—— 这次打开的登录上报 ——\n"];
@@ -2891,6 +2946,8 @@ static void NDShowReport(void) {
         }
     }
     [r appendString:@"下面是这次打开网盘发出的 POST。从中找登录、设备、上报这几类地址。\n"];
+    [r appendString:@"\n—— 请求里的 devuid ——\n"];
+    [r appendString:g_devuidLine ?: @"这次发出去的请求里没有 devuid。\n"];
     if (c.appsFlyerLastInstallDate > 0) {
         NSDate *afDate = [NSDate dateWithTimeIntervalSince1970:c.appsFlyerLastInstallDate];
         NSDateFormatter *fmt = [NSDateFormatter new];
