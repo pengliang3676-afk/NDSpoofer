@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.22.11
+//  版本：10.22.12
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -2894,6 +2894,7 @@ static void NDSeedPassCustom(NDConfig *c) {
 static UIButton *g_floatBtn = nil;
 static UIWindow *g_floatWin = nil;
 static BOOL g_hiidoUDIDHooked = NO;
+static NSString *g_hiidoHookNote = nil;
 static BOOL g_floatDocked = NO;
 static BOOL g_floatDockTimerOn = NO;
 static BOOL g_floatLoginOK = NO;
@@ -3087,7 +3088,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.22.11";
+    titleLbl.text = @"网解 10.22.12";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -3204,10 +3205,13 @@ static IMP nd_o_afSetTime = NULL;
 static IMP nd_o_afDataForKey = NULL;
 static IMP nd_o_afSetData = NULL;
 
+static void NDHookHiidoUDID(void);
+
 static void NDShowReport(void) {
+    NDHookHiidoUDID();
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.22.11\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendFormat:@"网解 10.22.12\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
     {
         NSTimeInterval boot = NDContainerBootTime(c);
         NSDateFormatter *bootFmt = [NSDateFormatter new];
@@ -3251,7 +3255,7 @@ static void NDShowReport(void) {
     } else {
         [r appendString:@"AppsFlyer 安装日期：未写入（这个容器第一次打开后才会有）\n\n"];
     }
-    [r appendFormat:@"海度设备号：%@\n", g_hiidoUDIDHooked ? @"按容器分开" : @"钩子没装上"];
+    [r appendFormat:@"海度设备号：%@\n", g_hiidoUDIDHooked ? @"按容器分开" : (g_hiidoHookNote ?: @"钩子没装上")];
     [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
     [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
         c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
@@ -3671,13 +3675,44 @@ static BOOL nd_hiido_setUserData(id self, SEL _cmd, id key, id data) {
     if (nd_o_hiidoSetUserData) return ((BOOL (*)(id, SEL, id, id))nd_o_hiidoSetUserData)(self, _cmd, key, data);
     return NO;
 }
+static BOOL NDHookHiidoMeta(Class meta, const char *selName, IMP repl, IMP *slot, char expectRet, unsigned expectArgs) {
+    if (!meta || !slot) return NO;
+    if (*slot) return YES;
+    SEL sel = sel_registerName(selName);
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(meta, &count);
+    BOOL ok = NO;
+    for (unsigned int i = 0; i < count; i++) {
+        if (method_getName(methods[i]) != sel) continue;
+        char ret[8] = {0};
+        method_getReturnType(methods[i], ret, sizeof(ret));
+        unsigned args = method_getNumberOfArguments(methods[i]);
+        if (ret[0] == expectRet && args == expectArgs) {
+            *slot = method_setImplementation(methods[i], repl);
+            ok = YES;
+            break;
+        }
+        g_hiidoHookNote = [NSString stringWithFormat:@"签名是 %c，%u 个参数", ret[0], args];
+    }
+    free(methods);
+    return ok;
+}
 static void NDHookHiidoUDID(void) {
+    if (g_hiidoUDIDHooked) return;
     Class cls = objc_lookUpClass("HDANA_EcryptHelper");
-    if (!cls) return;
-    // 13.35 里这两个是实例方法。setUserData:data: 返回 BOOL，不是 void。
-    BOOL got = NDReplaceOwnedMethod(cls, "getUserData:", (IMP)nd_hiido_getUserData, &nd_o_hiidoGetUserData, '@', 3);
-    BOOL set = NDReplaceOwnedMethod(cls, "setUserData:data:", (IMP)nd_hiido_setUserData, &nd_o_hiidoSetUserData, 'B', 4);
-    if (got && set) g_hiidoUDIDHooked = YES;
+    if (!cls) {
+        if (!g_hiidoHookNote) g_hiidoHookNote = @"没找到类";
+        return;
+    }
+    Class meta = object_getClass(cls);
+    BOOL got = NDHookHiidoMeta(meta, "getUserData:", (IMP)nd_hiido_getUserData, &nd_o_hiidoGetUserData, '@', 3);
+    BOOL set = NDHookHiidoMeta(meta, "setUserData:data:", (IMP)nd_hiido_setUserData, &nd_o_hiidoSetUserData, 'B', 4);
+    if (got && set) {
+        g_hiidoUDIDHooked = YES;
+        g_hiidoHookNote = nil;
+        return;
+    }
+    if (!g_hiidoHookNote) g_hiidoHookNote = @"类上没有这两个方法";
 }
 
 static BOOL NDHookHiidoKeychain(void) {
