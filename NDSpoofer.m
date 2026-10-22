@@ -1534,6 +1534,88 @@ static BOOL NDURLLooksPass(NSURL *u) {
 
 static NSMutableArray<NSString *> *g_loginPosts = nil;
 static NSString *g_devuidLine = nil;
+static NSString *g_sdkLine = nil;
+
+static BOOL NDURLIsSdkInit(NSURL *u) {
+    return [[u.path ?: @"" lowercaseString] containsString:@"sdkconfig/init"];
+}
+
+static void NDNoteSdk(NSString *text) {
+    if (!text.length) return;
+    if (!g_sdkLine) g_sdkLine = @"";
+    if (g_sdkLine.length > 900) return;
+    g_sdkLine = [[g_sdkLine stringByAppendingString:text] copy];
+}
+
+static NSString *NDKeyList(id obj) {
+    if ([obj isKindOfClass:NSDictionary.class]) {
+        NSArray *keys = [[((NSDictionary *)obj).allKeys valueForKey:@"description"] sortedArrayUsingSelector:@selector(compare:)];
+        if (keys.count > 20) keys = [keys subarrayWithRange:NSMakeRange(0, 20)];
+        return [keys componentsJoinedByString:@"、"];
+    }
+    if ([obj isKindOfClass:NSArray.class]) return [NSString stringWithFormat:@"数组%lu个", (unsigned long)[(NSArray *)obj count]];
+    return nil;
+}
+
+static void NDPickDeviceFields(id obj, NSMutableString *out, int depth) {
+    if (depth > 3 || ![obj isKindOfClass:NSDictionary.class]) return;
+    [(NSDictionary *)obj enumerateKeysAndObjectsUsingBlock:^(id key, id val, BOOL *stop) {
+        if (![key isKindOfClass:NSString.class]) return;
+        NSString *k = [(NSString *)key lowercaseString];
+        BOOL hit = [k containsString:@"devuid"] || [k containsString:@"device"] ||
+            [k isEqualToString:@"cuid"] || [k containsString:@"zid"] || [k containsString:@"date"];
+        if (hit && [val isKindOfClass:NSString.class]) {
+            NSString *v = val;
+            if (v.length > 48) v = [[v substringToIndex:48] stringByAppendingString:@"…"];
+            [out appendFormat:@"%@=%@\n", key, v];
+        } else if (hit && [val isKindOfClass:NSNumber.class]) {
+            [out appendFormat:@"%@=%@\n", key, val];
+        } else if ([val isKindOfClass:NSDictionary.class]) {
+            NDPickDeviceFields(val, out, depth + 1);
+        }
+    }];
+}
+
+static void NDNoteSdkRequest(NSURLRequest *req) {
+    if (!NDURLIsSdkInit(req.URL) || [g_sdkLine containsString:@"请求"]) return;
+    NSMutableString *s = [NSMutableString stringWithString:@"请求\n"];
+    NSArray *names = req.allHTTPHeaderFields.allKeys;
+    [s appendFormat:@"头：%@\n", names.count ? [names componentsJoinedByString:@"、"] : @"(无)"];
+    NSString *q = req.URL.query ?: @"";
+    if (q.length > 240) q = [[q substringToIndex:240] stringByAppendingString:@"…"];
+    [s appendFormat:@"query：%@\n", q.length ? q : @"(无)"];
+    if (req.HTTPBody.length && req.HTTPBody.length < 100000) {
+        NSString *b = [[NSString alloc] initWithData:req.HTTPBody encoding:NSUTF8StringEncoding];
+        if (b.length > 240) b = [[b substringToIndex:240] stringByAppendingString:@"…"];
+        [s appendFormat:@"body：%@\n", b.length ? b : @"(二进制)"];
+    } else if (req.HTTPBodyStream) {
+        [s appendString:@"body：是流，读不到\n"];
+    } else {
+        [s appendString:@"body：无\n"];
+    }
+    NDNoteSdk(s);
+}
+
+static void NDNoteSdkResponse(NSData *data) {
+    if ([g_sdkLine containsString:@"返回"]) return;
+    NSMutableString *s = [NSMutableString stringWithString:@"返回\n"];
+    if (!data.length) {
+        [s appendString:@"(空)\n"];
+        NDNoteSdk(s);
+        return;
+    }
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if ([obj isKindOfClass:NSDictionary.class] || [obj isKindOfClass:NSArray.class]) {
+        NSString *top = NDKeyList(obj);
+        if (top.length) [s appendFormat:@"字段：%@\n", top];
+        NDPickDeviceFields(obj, s, 0);
+    } else {
+        NSString *b = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (b.length > 240) b = [[b substringToIndex:240] stringByAppendingString:@"…"];
+        [s appendFormat:@"%@\n", b.length ? b : [NSString stringWithFormat:@"%lu字节", (unsigned long)data.length]];
+    }
+    NDNoteSdk(s);
+}
 
 static NSString *NDFormValue(NSString *s, NSString *key) {
     if (![s isKindOfClass:NSString.class] || !s.length || !key.length) return nil;
@@ -1628,6 +1710,7 @@ static void NDNoteLoginReport(NSURLRequest *req) {
     }
     NDHarvestDevuid(req.URL.absoluteString);
     NDHarvestDevuid(req.URL.query);
+    NDNoteSdkRequest(req);
     NDNoteLoginLine(line);
 }
 
@@ -2377,6 +2460,14 @@ static id ndu_tr_dt1(id self, SEL _cmd, NSURLRequest *req) {
 static id ndu_tr_dt2(id self, SEL _cmd, NSURLRequest *req, id handler) {
     NDConfig *c = NDCurrentConfig();
     NSURLRequest *r = NDURewriteRequest(req, (NSURLSession *)self, c);
+    if (handler && NDURLIsSdkInit(r.URL)) {
+        NDNoteSdkRequest(r);
+        void (^origH)(NSData *, NSURLResponse *, NSError *) = handler;
+        handler = [^(NSData *data, NSURLResponse *resp, NSError *err) {
+            NDNoteSdkResponse(data);
+            origH(data, resp, err);
+        } copy];
+    }
     return ((id(*)(id, SEL, id, id))objc_msgSend)(self, g_nduSelDt2, r, handler);
 }
 static void ndu_tr_conn(id cls, SEL _cmd, NSURLRequest *req, id queue, id handler) {
@@ -2948,6 +3039,8 @@ static void NDShowReport(void) {
     [r appendString:@"下面是这次打开网盘发出的 POST。从中找登录、设备、上报这几类地址。\n"];
     [r appendString:@"\n—— 请求里的 devuid ——\n"];
     [r appendString:g_devuidLine ?: @"这次发出去的请求里没有 devuid。\n"];
+    [r appendString:@"\n—— sdkconfig/init ——\n"];
+    [r appendString:g_sdkLine ?: @"这次没看到这个接口的内容。\n"];
     if (c.appsFlyerLastInstallDate > 0) {
         NSDate *afDate = [NSDate dateWithTimeIntervalSince1970:c.appsFlyerLastInstallDate];
         NSDateFormatter *fmt = [NSDateFormatter new];
