@@ -1596,6 +1596,8 @@ static void NDNoteSdkRequest(NSURLRequest *req) {
     NDNoteSdk(s);
 }
 
+static void NDHarvestDevuid(NSString *blob);
+
 static void NDNoteSdkBody(NSData *data) {
     if (!data.length || [g_sdkLine containsString:@"body："]) return;
     NSMutableString *s = [NSMutableString string];
