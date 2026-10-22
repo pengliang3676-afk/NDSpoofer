@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.22.06
+//  版本：10.22.07
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -540,6 +540,22 @@ static NSTimeInterval NDContainerBootTime(NDConfig *c) {
     return fresh;
 }
 
+static long long NDContainerOpenCount(void) {
+    static long long cached = 0;
+    static BOOL ready = NO;
+    if (ready) return cached;
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/nd_open_count.txt"];
+    NSString *saved = [[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]
+        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    long long n = saved.longLongValue;
+    if (n < 1) n = 1;
+    cached = n;
+    ready = YES;
+    [[NSString stringWithFormat:@"%lld", n + 1] writeToFile:path atomically:YES
+                                                   encoding:NSUTF8StringEncoding error:nil];
+    return n;
+}
+
 static NSString *NDRewriteSapiPlain(NSString *s, NDConfig *c) {
     if (![s isKindOfClass:NSString.class] || !s.length) return s;
     NSString *sep = @"\x01";
@@ -564,6 +580,18 @@ static NSString *NDRewriteSapiPlain(NSString *s, NDConfig *c) {
         if (f[21].longLongValue != want)
             f[21] = [NSString stringWithFormat:@"%lld", want];
     }
+    if (f.count > 22 && c.diskSizeGB > 0 && c.realDiskBytes > 0 &&
+        [f[22] rangeOfString:@"^\\d+$" options:NSRegularExpressionSearch].location != NSNotFound) {
+        long long v = f[22].longLongValue;
+        long long realKB = (long long)(c.realDiskBytes / 1024ULL);
+        long long fakeKB = (long long)c.diskSizeGB * 1024LL * 1024LL;
+        if (v > 0 && realKB > 0 && v <= realKB && fakeKB > realKB) {
+            long long outv = v * fakeKB / realKB;
+            if (outv < 1) outv = 1;
+            if (outv >= fakeKB) outv = fakeKB - fakeKB / 20;
+            f[22] = [NSString stringWithFormat:@"%lld", outv];
+        }
+    }
     if (f.count > 26 && f[26].length &&
         ([f[26] containsString:@":"] || [f[26] containsString:@"."]))
         f[26] = @"";
@@ -572,6 +600,9 @@ static NSString *NDRewriteSapiPlain(NSString *s, NDConfig *c) {
         long long up = (long long)(NSDate.date.timeIntervalSince1970 - boot);
         if (up < 120) up = 120;
         f[23] = [NSString stringWithFormat:@"%lld", up];
+    }
+    if (f.count > 11) {
+        f[11] = [NSString stringWithFormat:@"%lld", NDContainerOpenCount()];
     }
     return [f componentsJoinedByString:sep];
 }
@@ -3011,7 +3042,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.22.06";
+    titleLbl.text = @"网解 10.22.07";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -3129,7 +3160,7 @@ static IMP nd_o_afSetTime = NULL;
 static void NDShowReport(void) {
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.22.06\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendFormat:@"网解 10.22.07\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
     {
         NSTimeInterval boot = NDContainerBootTime(c);
         NSDateFormatter *bootFmt = [NSDateFormatter new];

@@ -256,7 +256,6 @@ static NSDictionary *NDDefaultTemplate(void) {
 
 // 一键随机：整套身份，所有开关一次开齐，同屏机型 + 独立 IDFV。
 static NSDictionary *NDRandomConfigForDevice(NSDictionary *existing, NSDictionary *device, NSString *configPath) {
-    (void)configPath;
     NSDictionary *system = NDRandomSystemForDevice(device);
     NSArray *disks = device[@"disks"];
     NSNumber *disk = disks[arc4random_uniform((uint32_t)disks.count)];
@@ -286,6 +285,9 @@ static NSDictionary *NDRandomConfigForDevice(NSDictionary *existing, NSDictionar
         NSTimeInterval boot = NSDate.date.timeIntervalSince1970 - (days * 86400.0) - extra;
         config[@"bootTime"] = @((long long)boot);
     }
+    NSString *countPath = [[configPath stringByDeletingLastPathComponent]
+        stringByAppendingPathComponent:@"nd_open_count.txt"];
+    [@"1" writeToFile:countPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
     [config addEntriesFromDictionary:@{
         @"configVersion": @1,
@@ -419,7 +421,7 @@ static void *NDLoadCraneLibrary(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"网解 10.22.06";
+    self.title = @"网解 10.22.07";
     self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
     self.selectedContainerIDs = [NSMutableSet set];
     self.tableView.rowHeight = 84.0;
