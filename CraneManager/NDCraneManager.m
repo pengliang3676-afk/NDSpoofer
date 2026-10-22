@@ -281,12 +281,10 @@ static NSDictionary *NDRandomConfigForDevice(NSDictionary *existing, NSDictionar
         config[@"idfv"] = NSUUID.UUID.UUIDString.uppercaseString;
     }
 
-    // 这个容器还没有 AppsFlyer 记录时，日期用这次一键随机的时间，重装次数为 0。
-    // Crane 新建容器会带上模板文件夹的旧创建时间，不能用那个时间。
-    // 已经写过的容器再点随机，不改这两项。
-    if (![config[@"appsFlyerLastInstallDate"] isKindOfClass:NSNumber.class] ||
-        [config[@"appsFlyerLastInstallDate"] doubleValue] <= 0) {
-        config[@"appsFlyerLastInstallDate"] = @((long long)NSDate.date.timeIntervalSince1970);
+    // 安装日期不要在这里提前写。提前写进钥匙串、本地还是空的，AppsFlyer 会当成重装。
+    // 日期等这个容器第一次真正打开时，由 AppsFlyer 自己生成，再按容器存下来。
+    // 重装次数从 0 起。已经写过的容器再点随机，不改次数。
+    if (![config[@"appsFlyerReinstallCounter"] isKindOfClass:NSNumber.class]) {
         config[@"appsFlyerReinstallCounter"] = @0;
     }
     {
@@ -438,7 +436,7 @@ static void *NDLoadCraneLibrary(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"网解 10.22.09";
+    self.title = @"网解 10.22.10";
     self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
     self.selectedContainerIDs = [NSMutableSet set];
     self.tableView.rowHeight = 84.0;
