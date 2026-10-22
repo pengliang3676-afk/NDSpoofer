@@ -3476,7 +3476,9 @@ static BOOL NDShouldRun(void) {
     return YES;
 }
 
-static NSMapTable *g_devuidOrig = nil;
+static Class g_devuidCls[8];
+static IMP g_devuidImp[8];
+static int g_devuidHookN = 0;
 
 static NSString *NDDevuidShort(NSString *v) {
     if (![v isKindOfClass:NSString.class] || !v.length) return @"(空)";
@@ -3502,11 +3504,11 @@ static void NDNoteDevuid(NSString *value) {
 
 static id nd_hook_devuid(id self, SEL _cmd) {
     IMP orig = NULL;
-    @synchronized (g_devuidOrig) {
-        for (Class cls = [self class]; cls; cls = class_getSuperclass(cls)) {
-            orig = (IMP)NSMapTableGet(g_devuidOrig, (__bridge const void *)cls);
-            if (orig) break;
+    for (Class cls = [self class]; cls; cls = class_getSuperclass(cls)) {
+        for (int i = 0; i < g_devuidHookN; i++) {
+            if (g_devuidCls[i] == cls) { orig = g_devuidImp[i]; break; }
         }
+        if (orig) break;
     }
     id value = orig ? ((id (*)(id, SEL))orig)(self, _cmd) : nil;
     if ([value isKindOfClass:NSString.class]) NDNoteDevuid(value);
@@ -3517,8 +3519,7 @@ static void NDInstallDevuidWatch(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         static const char *names[] = {"currentDevuid", "passDevuid", "devuid"};
-        g_devuidOrig = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsOpaqueMemory | NSPointerFunctionsOpaquePersonality
-                                             valueOptions:NSPointerFunctionsOpaqueMemory];
+        g_devuidHookN = 0;
         unsigned int count = 0;
         Class *list = objc_copyClassList(&count);
         if (!list) return;
@@ -3532,10 +3533,11 @@ static void NDInstallDevuidWatch(void) {
                 if (sup && class_getInstanceMethod(sup, sel) == m) continue;
                 const char *enc = method_getTypeEncoding(m);
                 if (!enc || strcmp(enc, "@16@0:8") != 0) continue;
+                if (g_devuidHookN >= 8) break;
                 IMP orig = method_setImplementation(m, (IMP)nd_hook_devuid);
-                @synchronized (g_devuidOrig) {
-                    NSMapTableSet(g_devuidOrig, (__bridge const void *)cls, orig);
-                }
+                g_devuidCls[g_devuidHookN] = cls;
+                g_devuidImp[g_devuidHookN] = orig;
+                g_devuidHookN++;
             }
         }
         free(list);
