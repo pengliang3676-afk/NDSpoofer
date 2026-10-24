@@ -1,7 +1,7 @@
 //
 //  NDSpoofer.m  —  百度网盘（com.baidu.netdisk）设备指纹伪装 dylib
 //
-//  版本：10.22.12
+//  版本：10.22.13
 //
 //  9.21-22：21 报告里 UA 已是 (iPhone14,5; …)，登录设备仍未知。PASS_CUSTOM_UA_WK
 //  只写了 NSUserDefaults，登录 WKWebView 未必用。改为在 PASSWebView/WKWebView
@@ -179,6 +179,9 @@ static NSString * const NDConfigFileName = @"ndspoofer_config.plist";
 @property(nonatomic, assign) CGFloat nativeScreenHeight;
 @property(nonatomic, assign) CGFloat screenScale;
 @property(nonatomic, copy) NSString *idfv;
+@property(nonatomic, copy) NSString *wifiSSID;
+@property(nonatomic, copy) NSString *idfa;
+@property(nonatomic, copy) NSString *iccid;
 @property(nonatomic, copy) NSString *passSdkVersion;
 @property(nonatomic, assign) double appsFlyerLastInstallDate;
 @property(nonatomic, assign) NSInteger appsFlyerReinstallCounter;
@@ -341,6 +344,9 @@ static void NDLoadConfig(void) {
         c.nativeScreenHeight = NDCfgDouble(d, @"nativeScreenHeight", 0);
         c.screenScale        = NDCfgDouble(d, @"screenScale", 0);
         c.idfv             = NDCfgStr(d, @"idfv", @"");
+        c.wifiSSID         = NDCfgStr(d, @"wifiSSID", @"");
+        c.idfa             = NDCfgStr(d, @"idfa", @"");
+        c.iccid            = NDCfgStr(d, @"iccid", @"");
         c.passSdkVersion   = NDCfgStr(d, @"passSdkVersion", @"9.8.12.20");
         c.appsFlyerLastInstallDate = NDCfgDouble(d, @"appsFlyerLastInstallDate", 0);
         c.containerBootTime = NDCfgDouble(d, @"bootTime", 0);
@@ -619,6 +625,31 @@ static long long NDContainerOpenCount(void) {
     return n;
 }
 
+static NSString *NDRandomSSID(void) {
+    NSArray *heads = @[@"ChinaNet", @"CMCC", @"TP-LINK", @"Xiaomi", @"HUAWEI"];
+    return [NSString stringWithFormat:@"%@-%04X",
+        heads[arc4random_uniform((uint32_t)heads.count)], arc4random_uniform(0x10000)];
+}
+static NSString *NDRandomICCID(void) {
+    NSMutableString *s = [NSMutableString stringWithString:@"8986"];
+    for (int i = 0; i < 16; i++) [s appendFormat:@"%u", arc4random_uniform(10)];
+    return s;
+}
+static void NDEnsureLoginExtras(NDConfig *c) {
+    if (!c || !c.enabled) return;
+    BOOL dirty = NO;
+    if (!c.wifiSSID.length) { c.wifiSSID = NDRandomSSID(); dirty = YES; }
+    if (!c.idfa.length) { c.idfa = NSUUID.UUID.UUIDString.uppercaseString; dirty = YES; }
+    if (!c.iccid.length) { c.iccid = NDRandomICCID(); dirty = YES; }
+    if (!dirty) return;
+    NSString *path = NDConfigPath();
+    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:path] mutableCopy] ?: [NSMutableDictionary dictionary];
+    if (c.wifiSSID.length) d[@"wifiSSID"] = c.wifiSSID;
+    if (c.idfa.length) d[@"idfa"] = c.idfa;
+    if (c.iccid.length) d[@"iccid"] = c.iccid;
+    [d writeToFile:path atomically:YES];
+}
+
 static NSString *NDRewriteSapiPlain(NSString *s, NDConfig *c) {
     if (![s isKindOfClass:NSString.class] || !s.length) return s;
     NSString *sep = @"\x01";
@@ -663,6 +694,11 @@ static NSString *NDRewriteSapiPlain(NSString *s, NDConfig *c) {
     if (f.count > 11) {
         f[11] = [NSString stringWithFormat:@"%lld", NDContainerOpenCount()];
     }
+    NDEnsureLoginExtras(c);
+    if (f.count > 15 && c.wifiSSID.length) f[15] = c.wifiSSID;
+    if (f.count > 24) f[24] = @"";
+    if (f.count > 32 && c.idfa.length) f[32] = c.idfa;
+    if (f.count > 36 && c.iccid.length) f[36] = c.iccid;
     return [f componentsJoinedByString:sep];
 }
 
@@ -2204,6 +2240,32 @@ static void NDInstallEBResolution(void) {
     g_installed++;
 }
 
+static IMP nd_o_idfa = NULL;
+static NSUUID *nd_hook_idfa(id self, SEL _cmd) {
+    NDConfig *c = NDCurrentConfig();
+    if (c.enabled && c.spoofBaiduSDK) {
+        NDEnsureLoginExtras(c);
+        NSUUID *u = [[NSUUID alloc] initWithUUIDString:c.idfa];
+        if (u) return u;
+    }
+    return nd_o_idfa ? ((NSUUID *(*)(id, SEL))nd_o_idfa)(self, _cmd) : nil;
+}
+static IMP nd_o_locOn = NULL;
+static BOOL nd_hook_locOn(id self, SEL _cmd) {
+    NDConfig *c = NDCurrentConfig();
+    if (c.enabled && c.spoofBaiduSDK) return NO;
+    return nd_o_locOn ? ((BOOL (*)(id, SEL))nd_o_locOn)(self, _cmd) : NO;
+}
+static IMP nd_o_locAuth = NULL;
+static IMP nd_o_locAuthInst = NULL;
+static NSInteger nd_hook_locAuth(id self, SEL _cmd) {
+    NDConfig *c = NDCurrentConfig();
+    if (c.enabled && c.spoofBaiduSDK) return 2;
+    if (nd_o_locAuth) return ((NSInteger (*)(id, SEL))nd_o_locAuth)(self, _cmd);
+    if (nd_o_locAuthInst) return ((NSInteger (*)(id, SEL))nd_o_locAuthInst)(self, _cmd);
+    return 0;
+}
+
 static void NDInstallAll(void) {
     // UIDevice 实例方法（含 category：platform/bdc_platformString/bba_cachedSystemVersion）
     NDInstallOne(@"UIDevice", @selector(systemVersion), NO, '@', 0, "",
@@ -2246,6 +2308,14 @@ static void NDInstallAll(void) {
                  (IMP)nd_hook_sapiLocalIP, &nd_o_sapiLocalIP);
     NDInstallOne(@"SAPIDeviceInfoHelper", NSSelectorFromString(@"getIPAddress:"), YES, '@', 1, "B",
                  (IMP)nd_hook_sapiGetIP, &nd_o_sapiGetIP);
+    NDInstallOne(@"ASIdentifierManager", NSSelectorFromString(@"advertisingIdentifier"), NO, '@', 0, "",
+                 (IMP)nd_hook_idfa, &nd_o_idfa);
+    NDInstallOne(@"CLLocationManager", NSSelectorFromString(@"locationServicesEnabled"), YES, 'B', 0, "",
+                 (IMP)nd_hook_locOn, &nd_o_locOn);
+    NDInstallOne(@"CLLocationManager", NSSelectorFromString(@"authorizationStatus"), YES, 'q', 0, "",
+                 (IMP)nd_hook_locAuth, &nd_o_locAuth);
+    NDInstallOne(@"CLLocationManager", NSSelectorFromString(@"authorizationStatus"), NO, 'q', 0, "",
+                 (IMP)nd_hook_locAuth, &nd_o_locAuthInst);
 
     // 悬浮球收边：只认 SAPI 登录成功 / 登出，不拿 BDUSS、不拿验证码页当登录。
     NDInstallOne(@"SAPILoginService", NSSelectorFromString(@"handleLoginWithModel:extraInfo:"), NO,
@@ -3088,7 +3158,7 @@ static NSString *NDShortUA(NSString *ua) {
     [self.view addSubview:card];
 
     UILabel *titleLbl = [UILabel new];
-    titleLbl.text = @"网解 10.22.12";
+    titleLbl.text = @"网解 10.22.13";
     titleLbl.textColor = UIColor.whiteColor;
     titleLbl.font = [UIFont boldSystemFontOfSize:16];
     titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
@@ -3211,179 +3281,88 @@ static void NDShowReport(void) {
     NDHookHiidoUDID();
     NDConfig *c = NDCurrentConfig();
     NSMutableString *r = [NSMutableString string];
-    [r appendFormat:@"网解 10.22.12\nUDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
+    [r appendString:@"网解 10.22.13\n\n—— 这个容器 ——\n"];
+    [r appendFormat:@"UDID：%@\nCUID：%@\n", NDContainerUDID(), NDContainerCUID()];
     {
         NSTimeInterval boot = NDContainerBootTime(c);
         NSDateFormatter *bootFmt = [NSDateFormatter new];
         bootFmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
         [r appendFormat:@"容器开机：%@\n", [bootFmt stringFromDate:[NSDate dateWithTimeIntervalSince1970:boot]]];
     }
-    [r appendString:@"\n—— 和上次打开比 ——\n"];
-    [r appendString:g_diDiff ?: @"这次还没生成设备包。用一会儿再点一次悬浮球。\n"];
-    [r appendString:@"\n—— 这次打开的登录上报 ——\n"];
-    if (!g_loginPosts.count) {
-        [r appendString:@"还没看到。完全退出网盘再打开，进首页后再点悬浮球。\n"];
-    } else {
-        @synchronized (g_loginPosts) {
-            for (NSString *line in g_loginPosts) [r appendFormat:@"%@\n", line];
-        }
+    NSString *openCount = nil;
+    if (g_plainAll.count > 11 && [g_plainAll[11] isKindOfClass:NSString.class] && g_plainAll[11].length)
+        openCount = g_plainAll[11];
+    else {
+        NSString *saved = [[NSString stringWithContentsOfFile:
+            [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/nd_open_count.txt"]
+            encoding:NSUTF8StringEncoding error:nil]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (saved.longLongValue > 0) openCount = saved;
     }
-    [r appendString:@"下面是这次打开网盘发出的 POST。从中找登录、设备、上报这几类地址。\n"];
-    [r appendString:@"\n—— 请求里的 devuid ——\n"];
-    [r appendString:g_devuidLine ?: @"这次发出去的请求里没有 devuid。\n"];
-    [r appendString:@"\n—— sdkconfig/init ——\n"];
-    [r appendString:g_sdkLine ?: @"这次没看到这个接口的内容。\n"];
+    [r appendFormat:@"打开次数：%@\n", openCount ?: @"还没记"];
+
+    [r appendString:@"\n—— 新装 ——\n"];
     if (c.appsFlyerLastInstallDate > 0) {
         NSDate *afDate = [NSDate dateWithTimeIntervalSince1970:c.appsFlyerLastInstallDate];
         NSDateFormatter *fmt = [NSDateFormatter new];
         fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
         int dateReads = atomic_load(&g_afDateReads);
         int counterReads = atomic_load(&g_afCounterReads);
-        [r appendFormat:@"AppsFlyer 安装日期：%@\nAppsFlyer 重装次数：%ld\n",
-            [fmt stringFromDate:afDate], (long)c.appsFlyerReinstallCounter];
-        BOOL afHooked = nd_o_afStringForKey || nd_o_afTimeForKey;
-        [r appendFormat:@"AppsFlyer 钩子：%@\n", afHooked ? @"已装上" : @"没装上"];
+        [r appendFormat:@"AppsFlyer 安装日期：%@\n", [fmt stringFromDate:afDate]];
         [r appendFormat:@"安装日期读取：%d 次，返回 %@\n", dateReads, g_afLastDate ?: @"(还没读到)"];
-        [r appendFormat:@"重装次数读取：%d 次，返回 %@\n\n", counterReads, g_afLastCounter ?: @"(还没读到)"];
-        [r appendString:@"读法：次数大于 0，且返回值和上面两行一致，才是已经生效。\n"];
-        if (!afHooked)
-            [r appendString:@"这次钩子没装上，网盘还在读原来的钥匙串。\n\n"];
-        else if (dateReads == 0 && counterReads == 0)
-            [r appendString:@"钩子已装上，但这次还没读到。完全退出网盘再打开，进首页后再看。\n\n"];
-        else
-            [r appendString:@"\n"];
+        [r appendFormat:@"重装次数：%ld\n", (long)c.appsFlyerReinstallCounter];
+        [r appendFormat:@"重装次数读取：%d 次，返回 %@\n", counterReads, g_afLastCounter ?: @"(还没读到)"];
     } else {
-        [r appendString:@"AppsFlyer 安装日期：未写入（这个容器第一次打开后才会有）\n\n"];
+        [r appendString:@"AppsFlyer 安装日期：未写入（这个容器第一次打开后才会有）\n"];
+        [r appendString:@"重装次数：0\n"];
     }
     [r appendFormat:@"海度设备号：%@\n", g_hiidoUDIDHooked ? @"按容器分开" : (g_hiidoHookNote ?: @"钩子没装上")];
-    [r appendFormat:@"总开关：%@\n", c.enabled ? @"开" : @"关"];
-    [r appendFormat:@"C层(sysctl/uname)：%@\nUIDevice：%@\n百度SDK：%@\nUA：%@\nIDFV：%@\n磁盘：%@\n屏幕：%@\nPASS_CUSTOM：%@\n",
-        c.spoofSysctl ? @"开" : @"关", c.spoofUIDevice ? @"开" : @"关", c.spoofBaiduSDK ? @"开" : @"关",
-        c.spoofUA ? @"开" : @"关", c.spoofIDFV ? @"开" : @"关", c.spoofStorage ? @"开" : @"关",
-        c.spoofScreen ? @"开" : @"关", c.seedPassCustom ? @"开" : @"关"];
-    [r appendFormat:@"\n伪装机型：%@ (%@)\n营销名：%@\n伪装系统：%@ (%@)\n内存：%ldMB\n磁盘：%ldGB，剩余 %.1fGB\n配置屏幕：%.0fx%.0f @%.0fx / 物理%.0fx%.0f\n",
-        c.hwMachine, c.hwModel, c.marketingName, c.systemVersion, c.systemBuild,
-        (long)c.memorySizeMB, (long)c.diskSizeGB,
-        (double)NDContainerFreeBytes(c) / (1024.0 * 1024.0 * 1024.0),
-        c.screenWidth, c.screenHeight, c.screenScale,
-        c.nativeScreenWidth, c.nativeScreenHeight];
-    [r appendFormat:@"\n真机机型：%@ (%@)\n真机系统：%@ (%@)\n真机内存：%lluMB\n真机磁盘：%lluGB\n",
-        c.realMachine, c.realModel, c.realOSVersion, c.realBuild,
-        c.realMemBytes / 1024 / 1024, c.realDiskBytes / 1024 / 1024 / 1024];
-    [r appendFormat:@"\n已安装 Hook：%d 个\n", g_installed];
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    [r appendFormat:@"\nPASS_CUSTOM_SYS_VER：%@\n", [d stringForKey:@"PASS_CUSTOM_SYS_VER"] ?: @"(未设置)"];
-    [r appendFormat:@"PASS_CUSTOM_UA_WK：%@\n", [d stringForKey:@"PASS_CUSTOM_UA_WK"] ?: @"(未设置)"];
-    [r appendFormat:@"登录WK强制UA：%d 次\n", g_wkForceUaN];
 
-    // 9.20-05 通道自检：直接调用会经过 NSProcessInfo hook；读 NSUserDefaults 看到的是出口收口后的实际值。
-    [r appendString:@"\n—— 9.20-05 通道自检 ——\n"];
-    NSProcessInfo *pi = [NSProcessInfo processInfo];
-    [r appendFormat:@"NSProcessInfo 内存：%lluMB\n", pi.physicalMemory / 1024ULL / 1024ULL];
-    [r appendFormat:@"NSProcessInfo 系统：%@\n", pi.operatingSystemVersionString];
-    NSOperatingSystemVersion osv = pi.operatingSystemVersion;
-    [r appendFormat:@"NSProcessInfo 版本：%ld.%ld.%ld\n",
-        (long)osv.majorVersion, (long)osv.minorVersion, (long)osv.patchVersion];
-    id splash = [d objectForKey:@"NADSplashLatestLogFormationKeyName"];
-    if ([splash isKindOfClass:NSDictionary.class]) {
-        NSDictionary *sd = (NSDictionary *)splash;
-        [r appendFormat:@"NADSplash 系统/内存：%@ / %@\n", sd[@"systemVersion"] ?: @"-", sd[@"physicalMemory"] ?: @"-"];
-    } else {
-        [r appendString:@"NADSplash：(尚未写入)\n"];
-    }
-    id sofire = [d objectForKey:@"dvlwfrqupdt"];
-    if ([sofire isKindOfClass:NSDictionary.class]) {
-        [r appendFormat:@"sofire hwphysm：%@\n", ((NSDictionary *)sofire)[@"hwphysm"] ?: @"-"];
-    } else {
-        [r appendString:@"sofire：(尚未写入)\n"];
-    }
-    [r appendFormat:@"NAD UA：%@\n", NDShortUA([d stringForKey:@"NADUserAgentKey"])];
-    [r appendFormat:@"BBA Check：%@\n", [d stringForKey:@"BBAUserAgentCheckInfoKey"] ?: @"(未写入)"];
+    NDEnsureLoginExtras(c);
+    [r appendString:@"\n—— 伪装手机 ——\n"];
+    [r appendFormat:@"机型：%@（%@）\n", c.hwMachine ?: @"-", c.hwModel ?: @"-"];
+    [r appendFormat:@"营销名：%@\n", c.marketingName.length ? c.marketingName : @"-"];
+    [r appendFormat:@"系统：%@（%@）\n", c.systemVersion ?: @"-", c.systemBuild ?: @"-"];
+    [r appendFormat:@"内存：%ldMB\n", (long)c.memorySizeMB];
+    [r appendFormat:@"磁盘：%ldGB，剩余 %.1fGB\n", (long)c.diskSizeGB,
+        (double)NDContainerFreeBytes(c) / (1024.0 * 1024.0 * 1024.0)];
+    [r appendFormat:@"屏幕：%.0fx%.0f @%.0fx，物理 %.0fx%.0f\n",
+        c.screenWidth, c.screenHeight, c.screenScale, c.nativeScreenWidth, c.nativeScreenHeight];
 
-    // 9.21-01 屏幕通道自检：直接调用百度统计类方法会经过 hook，显示上报层实际值（非 UIScreen）。
+    [r appendString:@"\n—— 真机 ——\n"];
+    [r appendFormat:@"机型：%@（%@）\n", c.realMachine ?: @"-", c.realModel ?: @"-"];
+    [r appendFormat:@"系统：%@（%@）\n", c.realOSVersion ?: @"-", c.realBuild ?: @"-"];
+    [r appendFormat:@"内存：%lluMB\n", c.realMemBytes / 1024 / 1024];
+    [r appendFormat:@"磁盘：%lluGB\n", c.realDiskBytes / 1024 / 1024 / 1024];
+
+    [r appendString:@"\n—— 发出去的值 ——\n"];
+    NSString *(^plain)(NSUInteger) = ^NSString *(NSUInteger i) {
+        if (i >= g_plainAll.count || ![g_plainAll[i] isKindOfClass:NSString.class] || !g_plainAll[i].length)
+            return nil;
+        return g_plainAll[i];
+    };
+    [r appendFormat:@"机型：%@\n", plain(3) ?: @"(还没抓到)"];
+    [r appendFormat:@"系统：%@\n", plain(4) ?: @"(还没抓到)"];
+    [r appendFormat:@"内存：%@ KB\n", plain(20) ?: @"(还没抓到)"];
+    [r appendFormat:@"总磁盘：%@ KB\n", plain(21) ?: @"(还没抓到)"];
+    [r appendFormat:@"剩余磁盘：%@ KB\n", plain(22) ?: @"(还没抓到)"];
+    [r appendFormat:@"开机秒数：%@\n", plain(23) ?: @"(还没抓到)"];
+    [r appendFormat:@"IP：%@\n", plain(26) ?: @"空"];
+    [r appendFormat:@"Wi-Fi 名：%@\n", plain(15) ?: (c.wifiSSID ?: @"-")];
+    [r appendFormat:@"广告 ID：%@\n", plain(32) ?: (c.idfa ?: @"-")];
+    [r appendString:@"定位：未开启\n"];
+    [r appendFormat:@"SIM 序列号：%@\n", plain(36) ?: (c.iccid ?: @"-")];
     Class ebCls = NSClassFromString(@"EBAppLogDeviceHelper");
     if (ebCls) {
-        [r appendString:@"\n—— 9.21-01 屏幕上报自检（EBAppLog）——\n"];
         SEL sRes = NSSelectorFromString(@"resolution");
         SEL sScale = NSSelectorFromString(@"screenScale");
-        SEL sStr = NSSelectorFromString(@"resolutionString");
         if ([ebCls respondsToSelector:sRes]) {
             CGSize ebR = ((CGSize (*)(id, SEL))[ebCls methodForSelector:sRes])(ebCls, sRes);
-            [r appendFormat:@"统计上报分辨率：%.0fx%.0f（逻辑×scale）\n", ebR.width, ebR.height];
+            double ebS = 0;
+            if ([ebCls respondsToSelector:sScale])
+                ebS = ((double (*)(id, SEL))[ebCls methodForSelector:sScale])(ebCls, sScale);
+            [r appendFormat:@"统计分辨率：%.0fx%.0f @%.0f\n", ebR.width, ebR.height, ebS];
         }
-        if ([ebCls respondsToSelector:sScale]) {
-            double ebS = ((double (*)(id, SEL))[ebCls methodForSelector:sScale])(ebCls, sScale);
-            [r appendFormat:@"统计缩放倍数：%.2f\n", ebS];
-        }
-        if ([ebCls respondsToSelector:sStr]) {
-            NSString *ebStr = ((NSString *(*)(id, SEL))[ebCls methodForSelector:sStr])(ebCls, sStr);
-            [r appendFormat:@"统计分辨率串：%@\n", ebStr ?: @"-"];
-        }
-    } else {
-        [r appendString:@"\nEBAppLogDeviceHelper：(类未加载，进 App 后再看)\n"];
-    }
-
-    [r appendString:@"\n—— Passport H5 自检（9.21-07，只读）——\n"];
-    [r appendFormat:@"最近 URL：%@\n", g_h5LastURL ?: @"(还没看到 Passport/wappass 导航)"];
-    NSArray *sharedDV = NDDVIFCookiesFromShared();
-    [r appendFormat:@"系统 Cookie 仓库 DVIF：%@（%lu 条）\n",
-        sharedDV.count ? @"有" : @"无", (unsigned long)sharedDV.count];
-    [r appendFormat:@"登录 WebView 仓库 DVIF：%@\n",
-        g_h5StoreDVIF < 0 ? @"未读到" : (g_h5StoreDVIF ? @"有" : @"无")];
-    [r appendFormat:@"PASSWebView loadRequest：%d 次，Cookie头带 DVIF：%d\n", g_h5LoadN, g_h5LoadDVIF];
-    [r appendFormat:@"PASSWebView 主文档导航：%d 次，Cookie头带 DVIF：%d\n", g_h5NavN, g_h5NavDVIF];
-    [r appendFormat:@"原生 HTTP(Passport相关)：%d 次，Cookie头带 DVIF：%d\n", g_h5HttpN, g_h5HttpDVIF];
-    [r appendString:@"读法：仓库「有」但登录设备仍未知 → Passport 登录不看 DVIF。\n"];
-    [r appendString:@"仓库「无」→ DVIF 没进登录 WebView。\n"];
-    [r appendString:@"Cookie 头经常是 0（WK 把 Cookie 放仓库不放头），以仓库为准。\n"];
-
-    [r appendString:@"\n—— H5 mini_di 桥（9.21-08，只读）——\n"];
-    [r appendFormat:@"sapi_action_mini_di 次数：%d\n", g_miniDiN];
-    [r appendFormat:@"H5 要的 di_keys：%@\n", g_miniDiKeys ?: @"(还没调到 mini_di)"];
-    [r appendFormat:@"retrieve 最近 keys：%@\n", g_retrieveKeys ?: @"(无)"];
-    [r appendFormat:@"retrieve 回包 PhoneModel：%@\n", g_lastDiPhone ?: @"(无)"];
-    [r appendFormat:@"retrieve 回包 device_name：%@\n", g_lastDiName ?: @"(无)"];
-    [r appendFormat:@"retrieve 回包 SystemVersion：%@\n", g_lastDiVer ?: @"(无)"];
-    [r appendFormat:@"回给 H5 次数：%d\n", g_cbN];
-    [r appendFormat:@"回给 H5 PhoneModel：%@\n", g_cbPhone ?: @"(无)"];
-    [r appendFormat:@"回给 H5 device_name：%@\n", g_cbName ?: @"(无)"];
-    [r appendFormat:@"回给 H5 SystemVersion：%@\n", g_cbVer ?: @"(无)"];
-    [r appendString:@"读法：di_keys 不含 PhoneModel → H5 登录根本不要机型。\n"];
-    [r appendString:@"keys 有 PhoneModel 且回包有值，登录设备仍未知 → Passport 不用这份机型。\n"];
-
-    [r appendString:@"\n—— 登录参数（9.21-14）——\n"];
-    [r appendFormat:@"写入次数：%d\n", g_wapParamN];
-    [r appendFormat:@"wkLoad/passLoad：%d  http登录路径：%d  原生短信：%d\n",
-        g_wapViaWk, g_wapViaHttp, g_wapViaSms];
-    [r appendFormat:@"addBase/smsBase：%d  Cookie：%d  其它：%d\n",
-        g_wapViaBase, g_wapViaCookie, g_wapViaExtra];
-    [r appendFormat:@"最近出口：%@\n", g_wapParamVia ?: @"(还没写到短信/WAP 参数)"];
-    [r appendFormat:@"最近内容：%@\n", g_wapParamLast ?: @"-"];
-    [r appendFormat:@"最近 Passport URL：%@\n", g_h5LastURL ?: @"(无)"];
-    [r appendString:@"看最近内容里的 has_di。登录 POST 有 di 仍未知 → 看下面明文字段是否自洽。\n"];
-    [r appendString:@"登录后看「登录设备」最新一条。\n"];
-
-    [r appendString:@"\n—— 加密前 di 明文（9.21-22）——\n"];
-    [r appendFormat:@"采样：%d  其中有SOH：%d  字段数：%d\n", g_plainN, g_plainSohN, g_plainCnt];
-    [r appendFormat:@"[3] PhoneModel：%@\n", g_plainPM ?: @"(无)"];
-    [r appendFormat:@"[4] SystemVersion：%@\n", g_plainVer ?: @"(无)"];
-    [r appendFormat:@"[20] ram(KB)：%@\n", g_plainRam ?: @"(无)"];
-    [r appendFormat:@"[21] disk(KB)：%@\n", g_plainDsk ?: @"(无)"];
-    [r appendFormat:@"配置内存：%ldMB  磁盘：%ldGB，剩余 %.1fGB  CPU：%@\n",
-        (long)c.memorySizeMB, (long)c.diskSizeGB,
-        (double)NDContainerFreeBytes(c) / (1024.0 * 1024.0 * 1024.0), c.cpuBrand ?: @"-"];
-    [r appendString:@"[22] 是这个容器自己的剩余，每次打开浮动一点，同一次打开不变。[26] 应空。下面是全部字段。\n"];
-    if (g_plainAll.count) {
-        NSUInteger n = MIN((NSUInteger)g_plainAll.count, (NSUInteger)48);
-        for (NSUInteger i = 0; i < n; i++) {
-            NSString *v = g_plainAll[i];
-            if (![v isKindOfClass:NSString.class] || !v.length) v = @"(空)";
-            else if (v.length > 42)
-                v = [[v substringToIndex:42] stringByAppendingString:@"…"];
-            [r appendFormat:@"[%lu] %@\n", (unsigned long)i, v];
-        }
-    } else {
-        [r appendString:@"（还没有 SOH 样本）\n"];
     }
 
     NDReportVC *rc = [[NDReportVC alloc] initWithReport:r];

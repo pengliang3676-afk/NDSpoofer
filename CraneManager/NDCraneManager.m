@@ -276,9 +276,18 @@ static NSDictionary *NDRandomConfigForDevice(NSDictionary *existing, NSDictionar
         [config addEntriesFromDictionary:existing];
     }
 
-    // 已有 IDFV 保留（容器内身份稳定）；没有则生成一套。
+    // 已有 IDFV 保留。Wi-Fi 名、广告 ID、SIM 序列号每次一键随机都重新抽。
     if (![config[@"idfv"] isKindOfClass:NSString.class] || ![config[@"idfv"] length]) {
         config[@"idfv"] = NSUUID.UUID.UUIDString.uppercaseString;
+    }
+    {
+        NSArray *heads = @[@"ChinaNet", @"CMCC", @"TP-LINK", @"Xiaomi", @"HUAWEI"];
+        config[@"wifiSSID"] = [NSString stringWithFormat:@"%@-%04X",
+            heads[arc4random_uniform((uint32_t)heads.count)], arc4random_uniform(0x10000)];
+        config[@"idfa"] = NSUUID.UUID.UUIDString.uppercaseString;
+        NSMutableString *iccid = [NSMutableString stringWithString:@"8986"];
+        for (int i = 0; i < 16; i++) [iccid appendFormat:@"%u", arc4random_uniform(10)];
+        config[@"iccid"] = iccid;
     }
 
     // 安装日期不要在这里提前写。提前写进钥匙串、本地还是空的，AppsFlyer 会当成重装。
@@ -436,7 +445,7 @@ static void *NDLoadCraneLibrary(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"网解 10.22.12";
+    self.title = @"网解 10.22.13";
     self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
     self.selectedContainerIDs = [NSMutableSet set];
     self.tableView.rowHeight = 84.0;
